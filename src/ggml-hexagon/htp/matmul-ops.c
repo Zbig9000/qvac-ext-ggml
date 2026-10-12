@@ -395,6 +395,56 @@ static void hvx_mm_f16_f32_panel_4x2(unsigned int nth, unsigned int ith, void * 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
 }
 
+// Residual variant keeps the production DDR worker unchanged.
+static void hvx_mm_f16_f32_panel_4x2_add(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+    const uint32_t mtiles = (ne01 + 3) / 4;
+    const uint32_t ntiles = (ne11 + 1) / 2;
+    const bool split_m = mtiles > ntiles;
+    const uint32_t tiles = split_m ? mtiles : ntiles;
+    const uint32_t per_thread = (tiles + nth - 1) / nth;
+    const uint32_t begin = MIN(ith * per_thread, tiles);
+    const uint32_t end = MIN(begin + per_thread, tiles);
+    if (begin == end) return;
+    const uint32_t m_begin = split_m ? 4 * begin : 0;
+    const uint32_t m_end = split_m ? MIN(4 * end, ne01) : ne01;
+    const uint32_t n_begin = split_m ? 0 : 2 * begin;
+    const uint32_t n_end = split_m ? ne11 : MIN(2 * end, ne11);
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+    for (uint32_t n = n_begin; n < n_end; n += 2) {
+        const uint8_t * a0 = (const uint8_t *) src1->data + n * nb11;
+        float * d0 = (float *) ((uint8_t *) dst->data + n * nb1);
+        const float * z0 = src2 ? (const float *) ((const uint8_t *) src2->data + (size_t) n * src2->nb[1]) : NULL;
+        if (n + 1 < n_end) {
+            const uint8_t * a1 = a0 + nb11;
+            float * d1 = (float *) ((uint8_t *) d0 + nb1);
+            const float * z1 = z0 ? z0 + src2->nb[1] / sizeof(float) : NULL;
+            uint32_t m = m_begin;
+            for (; m + 3 < m_end; m += 4) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_4x2_residual(ne00, d0 + m, d1 + m,
+                                      w0, w0 + nb01, w0 + 2 * nb01, w0 + 3 * nb01, a0, a1, z0 ? z0 + m : NULL, z1 ? z1 + m : NULL, tr);
+            }
+            for (; m + 1 < m_end; m += 2) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_2x2_residual(ne00, d0 + m, d1 + m, w0, w0 + nb01, a0, a1, z0 ? z0 + m : NULL, z1 ? z1 + m : NULL, tr);
+            }
+            if (m < m_end) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1_residual(ne00, d0 + m, w, a0, z0 ? z0 + m : NULL, tr);
+                vec_dot_f16_f32_panel_1x1_residual(ne00, d1 + m, w, a1, z1 ? z1 + m : NULL, tr);
+            }
+        } else {
+            for (uint32_t m = m_begin; m < m_end; ++m) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1_residual(ne00, d0 + m, w, a0, z0 ? z0 + m : NULL, tr);
+            }
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+}
+
 static inline void hvx_mm_f16_f32_pack_rows(const struct htp_tensor * src0, uint32_t ksize,
                                            uint32_t first, uint32_t count, float * packed) {
     for (uint32_t c = 0; c < count; ++c) {
@@ -459,6 +509,8 @@ static void hvx_mm_f16_f32_blocked_thread(unsigned int nth, unsigned int ith, vo
                 for (uint32_t r = rb; r < re; r += 2) {
                     const uint8_t * a0 = (const uint8_t *) src1->data + (size_t) r * nb11;
                     float * d0 = (float *) ((uint8_t *) dst->data + (size_t) r * nb1) + mc;
+                    const float * z0 = src2 ? (const float *) ((const uint8_t *) src2->data + (size_t) r * src2->nb[1]) + mc : NULL;
+                    const float * z1 = z0 && r + 1 < re ? z0 + src2->nb[1] / sizeof(float) : NULL;
                     uint32_t c = 0;
                     if (r + 1 < re) {
                         const uint8_t * a1 = a0 + nb11;
@@ -466,20 +518,20 @@ static void hvx_mm_f16_f32_blocked_thread(unsigned int nth, unsigned int ith, vo
                         for (; c + 3 < count; c += 4) {
                             const float * w = tile_weights + (size_t) c * ne00;
                             vec_dot_f32_packed_f32_4x2(ne00, d0 + c, d1 + c,
-                                                      w, w + ne00, w + 2 * ne00, w + 3 * ne00, a0, a1);
+                                                      w, w + ne00, w + 2 * ne00, w + 3 * ne00, a0, a1, z0 ? z0 + c : NULL, z1 ? z1 + c : NULL, tr);
                         }
                         for (; c + 1 < count; c += 2) {
                             const float * w = tile_weights + (size_t) c * ne00;
-                            vec_dot_f32_packed_f32_2x2(ne00, d0 + c, d1 + c, w, w + ne00, a0, a1);
+                            vec_dot_f32_packed_f32_2x2(ne00, d0 + c, d1 + c, w, w + ne00, a0, a1, z0 ? z0 + c : NULL, z1 ? z1 + c : NULL, tr);
                         }
                         for (; c < count; ++c) {
                             const float * w = tile_weights + (size_t) c * ne00;
-                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, w, a0);
-                            vec_dot_f32_packed_f32_1x1(ne00, d1 + c, w, a1);
+                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, w, a0, z0 ? z0 + c : NULL, tr);
+                            vec_dot_f32_packed_f32_1x1(ne00, d1 + c, w, a1, z1 ? z1 + c : NULL, tr);
                         }
                     } else {
                         for (; c < count; ++c) {
-                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, tile_weights + (size_t) c * ne00, a0);
+                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, tile_weights + (size_t) c * ne00, a0, z0 ? z0 + c : NULL, tr);
                         }
                     }
                 }
@@ -489,12 +541,48 @@ static void hvx_mm_f16_f32_blocked_thread(unsigned int nth, unsigned int ith, vo
     }
 }
 
+static bool hvx_mm_f16_f32_residual_layout(const struct htp_ops_context * octx, bool fused) {
+    htp_matmul_tensors_preamble;
+    if (src0->type != HTP_TYPE_F16 || src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
+        ne00 < 64 || ne00 % 32 || ne00 != ne10 || ne0 != ne01 || ne1 != ne11 || ne01 < 2 || ne11 < 2 ||
+        ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 || ne2 != 1 || ne3 != 1 || !octx->n_threads) return false;
+    if (fused != (src2 != NULL) ||
+        !htp_mm_f16_f32_rows_fit(ne00, ne01, 2, nb00, nb01, src0->size) ||
+        !htp_mm_f16_f32_rows_fit(ne10, ne11, 4, nb10, nb11, src1->size) ||
+        !htp_mm_f16_f32_rows_fit(ne0, ne1, 4, nb0, nb1, dst->size) ||
+        (src0->data & 1) || (src1->data & 3) || (dst->data & 3) ||
+        !htp_mm_f16_f32_disjoint(dst->data, dst->size, src0->data, src0->size) ||
+        !htp_mm_f16_f32_disjoint(dst->data, dst->size, src1->data, src1->size)) return false;
+    if (src2) {
+        if (src2->type != HTP_TYPE_F32 || (src2->data & 3) ||
+            ne20 != ne0 || ne21 != ne1 || ne22 != 1 || ne23 != 1 ||
+            src2->nb[1] != (size_t) ne0 * 4 || nb1 != (size_t) ne0 * 4 ||
+            !htp_mm_f16_f32_rows_fit(ne20, ne21, 4, src2->nb[0], src2->nb[1], src2->size) ||
+            !htp_mm_f16_f32_disjoint(src2->data, src2->size, src0->data, src0->size) ||
+            !htp_mm_f16_f32_disjoint(src2->data, src2->size, src1->data, src1->size) ||
+            !htp_mm_f16_f32_residual_alias_ok(dst->data, dst->size, src2->data, src2->size)) return false;
+    }
+    return true;
+}
+
+static int hvx_mm_f16_f32_ddr_add(struct htp_ops_context * octx) {
+    const struct htp_mm_kernel_params * p = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    if (!hvx_mm_f16_f32_residual_layout(octx, true) || p->tile_size != HTP_MM_F16_F32_PANEL_4X2 ||
+        p->n_hmx || p->vtcm_size || p->vtcm_src0_size || p->vtcm_src1_size || p->vtcm_dst_size) return HTP_STATUS_NO_SUPPORT;
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) return HTP_STATUS_OK;
+    struct htp_mm_context mmctx = { .octx = octx };
+    worker_pool_run_func(octx->ctx->worker_pool, hvx_mm_f16_f32_panel_4x2_add, &mmctx, octx->n_threads);
+    return HTP_STATUS_OK;
+}
+
 static int hvx_mm_f16_f32_blocked(struct htp_ops_context * octx) {
     htp_matmul_tensors_preamble;
     const struct htp_mm_kernel_params * p = (const struct htp_mm_kernel_params *) octx->kernel_params;
     size_t worker_bytes = 0, total = 0;
+    const bool fused = p->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD;
+    if (!hvx_mm_f16_f32_residual_layout(octx, fused)) return HTP_STATUS_NO_SUPPORT;
     // Recheck the tagged route at the DSP boundary before aligned VTCM writes.
-    if (src2 || src0->type != HTP_TYPE_F16 || src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
+    if (src0->type != HTP_TYPE_F16 || src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
         ne00 != ne10 || ne0 != ne01 || ne1 != ne11 || ne11 < 2 || ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 || ne2 != 1 || ne3 != 1 ||
         nb00 != 2 || nb10 != 4 || nb0 != 4 ||
         (size_t) nb01 < (size_t) ne00 * 2 || (size_t) nb11 < (size_t) ne10 * 4 || (size_t) nb1 < (size_t) ne01 * 4 ||
@@ -3886,7 +3974,12 @@ static void hvx_mm_k9_thread(unsigned int nth, unsigned int ith, void * data) {
 int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
-    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED) {
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_DDR_ADD) {
+        return hvx_mm_f16_f32_ddr_add(octx);
+    }
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED ||
+        kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD) {
         return hvx_mm_f16_f32_blocked(octx);
     }
 

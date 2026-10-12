@@ -74,6 +74,7 @@ static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -
 static int    opt_f16_f32_panel = 1; // DDR F32 activation panels; preserve VTCM routing
 static int    opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_4X2;
 static int    opt_f16_f32_blocked = 0; // prototype; retain production DDR 4x2 default
+static int    opt_f16_f32_fuse_add = 0; // independently measured residual epilogue prototype
 static int    opt_f16_f32_blocked_channels = 16;
 static int    opt_f16_f32_blocked_rows = 32;
 static int    opt_f16_f32_blocked_traversal = HTP_MM_F16_F32_BLOCKED_CHANNELS;
@@ -2958,6 +2959,56 @@ static void ggml_hexagon_precompute_fused_matmul_add_params(
     ggml_hexagon_precompute_matmul_params_impl(sess, mul_mat->src[0], mul_mat->src[1], mul_mat, src2->nb[1], kparams);
 }
 
+static bool ggml_hexagon_precompute_f32_residual_params(
+    const ggml_hexagon_session * sess, const ggml_tensor * mul_mat,
+    const ggml_tensor * residual, const ggml_tensor * output, htp_mm_kernel_params * kparams
+) {
+    if (!opt_f16_f32_fuse_add ||
+        residual->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul_mat, residual) || !ggml_are_same_shape(mul_mat, output) ||
+        !ggml_is_contiguous(residual) || !ggml_is_contiguous(output)) return false;
+
+    const ggml_tensor * w = mul_mat->src[0];
+    const ggml_tensor * a = mul_mat->src[1];
+    const auto fits = [](const ggml_tensor * t, size_t rows, size_t element_bytes) {
+        return htp_mm_f16_f32_rows_fit(t->ne[0], rows, element_bytes, t->nb[0], t->nb[1], ggml_nbytes(t)) &&
+               (uintptr_t(t->data) % element_bytes == 0);
+    };
+    const auto disjoint = [](const ggml_tensor * x, const ggml_tensor * y) {
+        return htp_mm_f16_f32_disjoint(uintptr_t(x->data), ggml_nbytes(x), uintptr_t(y->data), ggml_nbytes(y));
+    };
+    const size_t rows = ggml_nrows(output);
+    // Only full residuals with one contiguous output run. A destination may
+    // reuse the exact residual storage; shifted/partial overlaps are rejected.
+    if (w->type != GGML_TYPE_F16 || a->type != GGML_TYPE_F32 ||
+        w->ne[2] != 1 || w->ne[3] != 1 ||
+        !ggml_hexagon_rows_are_one_run(a) || !ggml_hexagon_rows_are_one_run(mul_mat) ||
+        !fits(w, w->ne[1], 2) || !fits(a, rows, 4) || !fits(residual, rows, 4) || !fits(output, rows, 4) ||
+        !disjoint(output, w) || !disjoint(output, a) || !disjoint(residual, w) || !disjoint(residual, a) ||
+        !htp_mm_f16_f32_residual_alias_ok(uintptr_t(output->data), ggml_nbytes(output),
+                                        uintptr_t(residual->data), ggml_nbytes(residual))) return false;
+
+    htp_mm_kernel_params candidate;
+    if (ggml_hexagon_mul_mat_flattens(mul_mat)) {
+        const ggml_hexagon_flat_mul_mat flat_mm(mul_mat);
+        ggml_hexagon_precompute_matmul_params(sess, w, &flat_mm.src1, &flat_mm.dst, &candidate);
+    } else {
+        ggml_hexagon_precompute_matmul_params(sess, w, a, mul_mat, &candidate);
+    }
+    // Preserve the standalone precision, VTCM-first choice and scratch budget.
+    if (candidate.n_hmx || (size_t) candidate.vtcm_size > sess->vtcm_size) return false;
+    if (candidate.kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED) {
+        candidate.kernel_type = HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD;
+    } else if (candidate.kernel_type == HTP_MM_KERNEL_HVX_F16_F32_DDR &&
+               candidate.tile_size == HTP_MM_F16_F32_PANEL_4X2) {
+        candidate.kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR_ADD;
+    } else {
+        return false;
+    }
+    *kparams = candidate;
+    return true;
+}
+
 static void ggml_hexagon_precompute_unary_params(
     const struct ggml_hexagon_session * sess,
     uint32_t op,
@@ -4233,7 +4284,8 @@ static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph *
                     ggml_hexagon_precompute_fused_matmul_add_params(sess, n, src2, &kparams);
                 }
                 const int src1_nrows = n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3];
-                const bool can_fuse = (kparams.n_hmx > 0) || (src1_nrows == 1);
+                const bool f32_residual = ggml_hexagon_precompute_f32_residual_params(sess, n, src2, next_node, &kparams);
+                const bool can_fuse = (kparams.n_hmx > 0) || (src1_nrows == 1) || f32_residual;
                 if (can_fuse && (size_t)kparams.vtcm_size <= sess->vtcm_size) {
                     htp_opnode node(n, {}, HTP_OP_MUL_MAT_ADD);
                     node.add_fused(next_node);
@@ -5120,6 +5172,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * blocked_channels = getenv("GGML_HEXAGON_F16_F32_BLOCKED_CHANNELS");
     const char * blocked_rows = getenv("GGML_HEXAGON_F16_F32_BLOCKED_ROWS");
     opt_f16_f32_blocked = blocked && strcmp(blocked, "1") == 0;
+    const char * fuse_add = getenv("GGML_HEXAGON_F16_F32_FUSE_ADD");
+    opt_f16_f32_fuse_add = fuse_add && strcmp(fuse_add, "1") == 0;
     if (blocked_channels) {
         if (strcmp(blocked_channels, "8") == 0) opt_f16_f32_blocked_channels = 8;
         else if (strcmp(blocked_channels, "16") == 0) opt_f16_f32_blocked_channels = 16;
@@ -5140,6 +5194,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
     if (opt_f16_f32_blocked) GGML_LOG_INFO("ggml-hex: F16/F32 blocked prototype enabled (channels=%d rows=%d traversal=%d)\n",
                                        opt_f16_f32_blocked_channels, opt_f16_f32_blocked_rows, opt_f16_f32_blocked_traversal);
+    if (opt_f16_f32_fuse_add) GGML_LOG_INFO("ggml-hex: F16/F32 full residual epilogue prototype enabled\n");
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
