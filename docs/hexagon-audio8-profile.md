@@ -745,8 +745,77 @@ start:
 The 4x2 panel reduced total time by 7.68% and codec time by 18.17%. All 16
 outputs had identical 66-frame codes and WAV hashes. These are existing S1
 measurements of explicitly selected panels, not a new run of the default
-change or an S1–S5 speedup claim. The saved evidence does not include the
-remaining S2–S5 comparison or performance tuning across worker counts.
+change. The complete S1–S5 capture was subsequently recovered from the same
+phone and validated on October 12; see the table below. Performance tuning
+across worker counts is not included in these results.
 Evidence is recorded on QVAC-26763 and in
 `hexagon-26763-build/results/phone-s1-summary.json` and
 `hexagon-26763-build/results/phone-fixed-acceptance.json` beside the checkout.
+
+
+### Recovered October 8 S1–S5 comparison
+
+The phone retained the completed `phone-20261008-1434` suite even though the
+local handoff stopped at S1. All five prompt captures pass the existing strict
+artifact validator: three warmups and five timed runs per variant, profiling
+off, thermal status 0 before every run, finite stage timings, valid frame/code
+and WAV geometry, and byte-identical codes/WAVs across both panels and all
+repeats for each prompt. The manifest is the same as the saved S1 evidence.
+
+| Prompt | Frames | 2x2 median inference (s) | 4x2 median inference (s) | Less inference time |
+| --- | ---: | ---: | ---: | ---: |
+| S1 | 66 | 14.5259 | 13.4106 | 7.68% |
+| S2 | 55 | 11.8784 | 10.8054 | 9.03% |
+| S3 | 70 | 15.9245 | 14.6666 | 7.90% |
+| S4 | 70 | 17.1649 | 14.6040 | 14.92% |
+| S5 | 94 | 20.9144 | 19.9595 | 4.57% |
+
+The sum of per-prompt inference medians is 8.66% lower with 4x2. This is an
+aggregate of those five medians, not a new measured run or a universal gain.
+S4 reaches its frame cap. Some runs finish at thermal status 1, and several
+codec stage measurements have substantial variation; the S4/S5 codec medians
+are higher with 4x2. The consistently lower full-inference medians do not
+establish a uniform codec-stage improvement. The raw records and validation
+summary are retained in
+`hexagon-4x2-default-build/results/historical-suite/` and
+`hexagon-4x2-default-build/results/historical-suite-summary.json` beside the
+checkout.
+
+
+### Compiled-default correctness, October 12
+
+A fresh Hexagon host and DSP v79 build of runtime commit `74861e5e` was tested
+on the OnePlus 13s/SM8750. The same October CLI and shared CPU/OpenCL runtime
+were used for fixed-code comparisons; the OpenCL-enabled reference loader was
+recovered from the phone and its SHA-256 matches the historical manifest.
+The core/CPU/OpenCL sources have no diff between `5687b0e7` and `e282e85b`.
+Host, Android and DSP builds pass. All 29 host CPU-dequantized F32 oracle cases
+and the host operation-cache regression pass.
+
+On the device, all 29 oracle cases pass with 1, 2 and 6 HVX workers for each
+of explicit 2x2, explicit 4x2 and the shape setting unset. Every canonical
+result matches the same-build explicit 2x2 baseline byte for byte. The unset
+setting selects `hvx-panel-4x2` for eligible DDR cases in the separate routing
+capture. F32 arithmetic, VTCM precedence and excluded-layout fallbacks retain
+their existing behavior.
+
+All 25 fixed-code CPU/Hexagon/OpenCL boundary gates pass for 3 and 66 frames.
+The compiled default and explicit 2x2 produce byte-identical PCM at both
+lengths. Direct default Hexagon/OpenCL PCM cosine is 0.9999900834, NMSE
+1.9834e-5. The host buffer/CPU-copy/repack device regression also passes.
+
+Raw evidence and the independently validated fixed-code summary are retained
+in `hexagon-4x2-default-build/results/default4x2-20261012b/` and
+`hexagon-4x2-default-build/results/default-fixed-summary.json` beside the
+checkout. Runtime hashes and the shared-runtime provenance are in
+`hexagon-4x2-default-build/results/runtime-provenance-v3.json`.
+
+
+An invalid shape setting warns and uses 4x2; all 29 device oracle outputs with
+that setting and one worker match the compiled default exactly. A fresh greedy
+S1 synthesis with the shape setting unset produces the same 66-frame code/WAV
+SHA-256 values recorded above. The attempted new repeated S1 timing run was
+stopped before synthesis while waiting for thermal status 0: the service kept
+reporting status 1 with a cached `shell_skin` sample absent from current HAL
+readings. No thermal override was applied. The single synthesis is correctness
+evidence only; performance claims use the validated October 8 suite.
