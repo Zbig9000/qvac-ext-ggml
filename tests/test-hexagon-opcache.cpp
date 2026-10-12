@@ -46,7 +46,7 @@ static bool matches(const std::vector<htp_opnode> & actual, const std::vector<ht
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expr); ggml_free(ctx); return 1; } } while (0)
 
 int main() {
-    ggml_init_params params = { 64 * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params params = { 64 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         return 1;
@@ -63,6 +63,22 @@ int main() {
     ggml_set_name(bias, "bias");
     ggml_set_name(add, "biased");
     ggml_set_name(relu, "activated");
+
+    // Use real graph bookkeeping for the two graph guards, including a
+    // consumer discovered after the candidate's immediately adjacent ADD.
+    auto * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, relu);
+    CHECK(ggml_graph_n_nodes(graph) == 3);
+    CHECK(ggml_graph_node(graph, 0) == mm && ggml_graph_node(graph, 1) == add);
+    CHECK(ggml_can_fuse(graph, 0, {GGML_OP_MUL_MAT, GGML_OP_ADD}));
+    ggml_set_output(mm);
+    CHECK(!ggml_can_fuse(graph, 0, {GGML_OP_MUL_MAT, GGML_OP_ADD}));
+    mm->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+    CHECK(ggml_can_fuse(graph, 0, {GGML_OP_MUL_MAT, GGML_OP_ADD}));
+    auto * second_consumer = ggml_scale(ctx, mm, 2.0f);
+    ggml_build_forward_expand(graph, second_consumer);
+    CHECK(ggml_graph_n_nodes(graph) == 4 && ggml_graph_node(graph, 3) == second_consumer);
+    CHECK(!ggml_can_fuse(graph, 0, {GGML_OP_MUL_MAT, GGML_OP_ADD}));
 
     htp_opnode fused(mm, {add, relu}, HTP_OP_MUL_MAT_ADD, {add, relu});
     htp_mm_kernel_params kernel = {};
@@ -84,7 +100,7 @@ int main() {
     CHECK(worker_bytes == 6144 && total_bytes == 36864 && worker_bytes % 128 == 0);
     blocked_kernel.vtcm_size = total_bytes;
     std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
-    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 vtcm 36864");
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 traversal channels vtcm 36864");
     CHECK(htp_mm_f16_f32_blocked_scratch(96, 7, 16, 6, &worker_bytes, &total_bytes));
     CHECK(worker_bytes == 2688 && total_bytes == 16128);
     CHECK(!htp_mm_f16_f32_blocked_scratch(97, 17, 16, 6, &worker_bytes, &total_bytes));
@@ -95,14 +111,65 @@ int main() {
 
     blocked_kernel.pipeline = HTP_MM_F16_F32_BLOCKED_ROWS;
     std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
-    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 vtcm 36864 traversal rows");
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 traversal rows vtcm 36864");
     CHECK(htp_mm_f16_f32_blocked_scratch_for_traversal(384, 384, 16, 6,
         HTP_MM_F16_F32_BLOCKED_MATRIX, &worker_bytes, &total_bytes));
     CHECK(worker_bytes == 589824 && total_bytes == 3538944 && worker_bytes % 128 == 0);
     blocked_kernel.pipeline = HTP_MM_F16_F32_BLOCKED_MATRIX;
     blocked_kernel.vtcm_size = total_bytes;
     std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
-    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 vtcm 3538944 traversal matrix");
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 traversal matrix vtcm 3538944");
+    blocked_kernel.kernel_type = HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD;
+    std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32-add channels 16 rows 32 traversal matrix vtcm 3538944");
+    htp_mm_kernel_params residual_kernel = {};
+    residual_kernel.kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR_ADD;
+    std::memcpy(blocked.kernel_params, &residual_kernel, sizeof(residual_kernel));
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-panel-4x2-add vtcm 0");
+    CHECK(htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 36, 1188));
+    CHECK(htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 44, 1444));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 44, 1443));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 8, 36, 1188));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 35, 1188));
+    CHECK(!htp_mm_f16_f32_rows_fit(SIZE_MAX, 33, 4, 4, 36, SIZE_MAX));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, SIZE_MAX, 4, 4, 36, SIZE_MAX));
+    CHECK(htp_mm_f16_f32_rows_fit(9, 1, 4, 4, 44, 36));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 1, 4, 4, 44, 35));
+    CHECK(!htp_mm_f16_f32_rows_fit(0, 33, 4, 4, 36, 1188));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 0, 4, 4, 36, 1188));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 0, 0, 36, 1188));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 37, 1221));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 4, size_t(UINT32_MAX) + 1, SIZE_MAX));
+    CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 36, size_t(UINT32_MAX) + 1));
+    CHECK(!htp_mm_f16_f32_rows_fit(UINT32_MAX, UINT32_MAX, 4, 4, UINT32_MAX - 3, UINT32_MAX));
+    CHECK(htp_mm_f16_f32_disjoint(128, 128, 256, 128));
+    CHECK(htp_mm_f16_f32_disjoint(256, 128, 128, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 128, 252, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(252, 128, 128, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 256, 192, 32));
+    CHECK(!htp_mm_f16_f32_disjoint(192, 32, 128, 256));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 128, 128, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(0, 128, 256, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 0, 256, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 128, 0, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 128, 256, 0));
+    CHECK(!htp_mm_f16_f32_disjoint(UINTPTR_MAX - 16, 32, 128, 128));
+    CHECK(!htp_mm_f16_f32_disjoint(128, 128, UINTPTR_MAX - 16, 32));
+    // These are actual shared host/DSP eligibility predicates. Shifted ADD
+    // aliases are undefined ggml graphs, so validate their rejected ranges
+    // here; the device suite covers the valid exact-residual alias graph.
+    CHECK(htp_mm_f16_f32_residual_alias_ok(128, 128, 128, 128));
+    CHECK(htp_mm_f16_f32_residual_alias_ok(128, 128, 256, 128));
+    CHECK(htp_mm_f16_f32_residual_alias_ok(256, 128, 128, 128));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(132, 128, 128, 128));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(128, 128, 132, 128));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(128, 128, 128, 124));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(128, 124, 128, 128));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(128, 256, 192, 32));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(0, 128, 0, 128));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(128, 0, 128, 0));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(UINTPTR_MAX - 16, 32, UINTPTR_MAX - 16, 32));
+    CHECK(!htp_mm_f16_f32_residual_alias_ok(128, 128, UINTPTR_MAX - 16, 32));
     CHECK(htp_mm_f16_f32_blocked_scratch_for_traversal(384, 384, 16, 6,
         HTP_MM_F16_F32_BLOCKED_ROWS, &worker_bytes, &total_bytes));
     CHECK(worker_bytes == 24576 && total_bytes == 147456);
@@ -160,6 +227,6 @@ int main() {
     cache.capture(1, source, 0);
     CHECK(cache[1].empty());
     ggml_free(ctx);
-    std::puts("PASS: live-prefix cache, nested ownership, slot reuse, profile/error metadata");
+    std::puts("PASS: live-prefix cache, nested ownership, slot reuse, profile/error metadata, graph guards, checked residual ranges");
     return 0;
 }
