@@ -212,9 +212,9 @@ CPU/OpenCL timings and does not replace the separate panel-on/off experiment.
 
 ## F32 codec panels
 
-The Hexagon backend enables a 2x2 HVX DDR output panel by default for
-unbatched F16-weight/F32-activation matmuls. It widens the weights to F32 and
-reuses each weight and activation vector across two outputs. The existing
+The Hexagon backend enables a 4x2 HVX DDR output panel by default for
+unbatched F16-weight/F32-activation matmuls. Four output channels share each
+pair of activation rows, with weights widened to F32. The existing
 `vec_dot_f16_f32_uu_1x1` narrows activations to F16 internally, so this panel
 changes arithmetic as well as data reuse. F32 precision requested by a graph
 does not by itself prove that the old DDR helper retains F32 activations.
@@ -675,19 +675,19 @@ runs, and check per-stage cosine >=0.9999 plus generated tokens, EOS, frame
 count, and audio quality. Do not enable a routing change based only on these
 synthetic backend tests.
 
-## Codec panel prototype (QVAC-26763)
+## Default 4x2 codec panel (QVAC-26763)
 
 The follow-up [QVAC-26763](https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219313976732459)
-adds a selectable 4x2 HVX panel for the existing F16-weight/F32-activation DDR
+adds the default 4x2 HVX panel for the existing F16-weight/F32-activation DDR
 route. Four output channels share each pair of activation rows. Each output
 retains the 2x2 panel's F32 low-then-high accumulation order and pairwise
 reduction. VTCM selection, F32 precision guards and unsupported-shape fallbacks
-remain unchanged. The validated 2x2 panel remains the default until device
-correctness and performance gates pass; all previously validated optimizations
-remain enabled by default.
+remain unchanged. Device correctness and paired S1 performance evidence are
+recorded below. All previously validated optimizations remain enabled by default.
 
-For candidate testing, set `GGML_HEXAGON_F16_F32_PANEL_SHAPE=4x2`; use `2x2`
-or unset it for the default. Invalid values warn and select 2x2. The existing
+Unset `GGML_HEXAGON_F16_F32_PANEL_SHAPE` or set it to `4x2` for the default;
+set it to `2x2` to select the previous panel. Invalid values warn and select
+the default 4x2 panel. The existing
 `GGML_HEXAGON_F16_F32_PANEL=0` override still disables panel routing.
 With profiling enabled, selected 4x2 operations report `hvx-panel-4x2`.
 Capture that routing evidence separately from unprofiled timing runs.
@@ -726,8 +726,27 @@ The 4x2 worker is larger (850 instruction words and a 144-byte scalar frame,
 versus 517 words and 104 bytes for 2x2). This establishes build and static
 readiness, not a speedup.
 
-Device correctness, exact cross-panel agreement, CPU/OpenCL fixed-code gates,
-worker-count tuning and repeated S1–S5 timing are pending. The renewed QDC
-session exposed a different SM8750 device serial; it lost its upstream endpoint
-during model staging. Fresh baseline and candidate measurements on the same
-device are required before promotion or performance claims.
+Device validation subsequently completed on October 8 on the OnePlus 13s
+(CPH2723, SM8750/v79). All 29 oracle cases passed for both panel shapes with
+1, 2 and 6 HVX workers, with byte-identical results between panels. All 25
+fixed-code CPU/Hexagon/OpenCL codec boundary gates passed. Hexagon/OpenCL PCM
+cosine was 0.9999900834 and NMSE was 1.9834e-5 at 66 fixed frames.
+
+Paired S1 runs used the same build, models and device, greedy seed 42, four
+threads, all validated optimizations enabled, profiling off, three warmups and
+five timed runs per panel, alternating order, and thermal status 0 at every
+start:
+
+| Panel | Median inference (s) | Median codec synthesis (s) |
+| --- | ---: | ---: |
+| 2x2 | 14.5259 | 7.1467 |
+| 4x2 | 13.4106 | 5.8482 |
+
+The 4x2 panel reduced total time by 7.68% and codec time by 18.17%. All 16
+outputs had identical 66-frame codes and WAV hashes. These are existing S1
+measurements of explicitly selected panels, not a new run of the default
+change or an S1–S5 speedup claim. The saved evidence does not include the
+remaining S2–S5 comparison or performance tuning across worker counts.
+Evidence is recorded on QVAC-26763 and in
+`hexagon-26763-build/results/phone-s1-summary.json` and
+`hexagon-26763-build/results/phone-fixed-acceptance.json` beside the checkout.

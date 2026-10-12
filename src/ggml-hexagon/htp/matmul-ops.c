@@ -346,7 +346,7 @@ static void hvx_mm_f16_f32_panel(unsigned int nth, unsigned int ith, void * data
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
 }
 
-// Experimental wider panel. Partition complete 4x2 tiles; the existing
+// Default DDR panel. Partition complete 4x2 tiles; the existing
 // 2x2/1x1 helpers cover only the final channel/activation remainders.
 static void hvx_mm_f16_f32_panel_4x2(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;

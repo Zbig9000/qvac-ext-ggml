@@ -72,7 +72,7 @@ static int    opt_hostbuf = 1; // hostbuf ON by default
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_f16_f32_panel = 1; // DDR F32 activation panels; preserve VTCM routing
-static int    opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_2X2;
+static int    opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_4X2;
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -2768,7 +2768,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
         } else {
-            // Preserve F32 activations and reuse an output panel (2x2 by default).
+            // Preserve F32 activations and reuse an output panel (4x2 by default).
             // Keep the existing VTCM 2x2 path whenever it fits: it reuses staged
             // activations and prefetched weights more efficiently for smaller graphs.
             if (opt_f16_f32_panel && !is_matmul_id && src2_row_size == 0 &&
@@ -5090,9 +5090,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         } else if (strcmp(str_f16_f32_panel_shape, "2x2") == 0) {
             opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_2X2;
         } else {
-            GGML_LOG_WARN("ggml-hex: ignoring unsupported F16_F32_PANEL_SHAPE=%s; using 2x2\n",
+            GGML_LOG_WARN("ggml-hex: ignoring unsupported F16_F32_PANEL_SHAPE=%s; using 4x2\n",
                           str_f16_f32_panel_shape);
-            opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_2X2;
+            opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_4X2;
         }
     }
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;

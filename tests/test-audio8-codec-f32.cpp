@@ -55,7 +55,7 @@ static const shape cases[] = {
     {"ddr-varied-k384", 384,  5, 10923, 1, true,  false, true, true},
     // Exercise full four-channel panels and their two-channel remainder,
     // including K64, unaligned row views, and both even/odd activation rows.
-    // These also remain valid oracle cases for the default 2x2 panel.
+    // These also remain valid oracle cases for the explicit 2x2 override.
     {"ddr-four-k96",      96,  4, 32770, 1, false, false, true},
     {"ddr-six-k64",       64,  6, 65537, 1, true,  false, true, true},
     {"ddr-eight-k192",   192,  8, 21849, 1, true,  false, true, true},
