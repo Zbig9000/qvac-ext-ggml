@@ -278,6 +278,26 @@ struct ggml_hexagon_flat_mul_mat {
     ggml_hexagon_flat_mul_mat & operator=(const ggml_hexagon_flat_mul_mat &) = delete;
 };
 
+static bool ggml_hexagon_f16_f32_blocked_layout(
+    const ggml_tensor * weights, const ggml_tensor * activation, const ggml_tensor * output
+) {
+    const auto fits = [](const ggml_tensor * t, size_t element_bytes) {
+        return htp_mm_f16_f32_rows_fit(t->ne[0], t->ne[1], element_bytes,
+                                      t->nb[0], t->nb[1], ggml_nbytes(t)) &&
+               (!t->data || uintptr_t(t->data) % element_bytes == 0);
+    };
+    const auto disjoint = [](const ggml_tensor * x, const ggml_tensor * y) {
+        // supports_op also plans tensors before allocation. Once storage is
+        // available, graph dispatch must satisfy the DSP's alias checks.
+        return !x->data || !y->data ||
+               htp_mm_f16_f32_disjoint(uintptr_t(x->data), ggml_nbytes(x), uintptr_t(y->data), ggml_nbytes(y));
+    };
+    return weights->ne[0] == activation->ne[0] && output->ne[0] == weights->ne[1] &&
+           output->ne[1] == activation->ne[1] &&
+           fits(weights, 2) && fits(activation, 4) && fits(output, 4) &&
+           disjoint(output, weights) && disjoint(output, activation);
+}
+
 struct ggml_hexagon_session;
 
 static void ggml_hexagon_precompute_matmul_params(
@@ -2788,7 +2808,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                 kparams->tile_size = opt_f16_f32_panel_shape;
                 kparams->src1_row_size = src1->nb[1];
                 size_t worker_bytes = 0, packed_bytes = 0;
-                if (opt_f16_f32_blocked &&
+                if (opt_f16_f32_blocked && ggml_hexagon_f16_f32_blocked_layout(src0, src1, dst) &&
                     htp_mm_f16_f32_blocked_scratch_for_traversal(ne10, src0->ne[1], opt_f16_f32_blocked_channels,
                                                  sess->n_threads, opt_f16_f32_blocked_traversal, &worker_bytes, &packed_bytes) &&
                     packed_bytes <= vtcm_budget) {
@@ -2801,7 +2821,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                     HEX_VERBOSE("ggml-hex: F16/F32 blocked k=%d channels=%lld rows=%d tile=%d block=%d traversal=%d scratch=%zu\n",
                                 ne10, (long long) src0->ne[1], ne11, kparams->m_chunk, kparams->n_chunk, kparams->pipeline, packed_bytes);
                 } else if (opt_f16_f32_blocked) {
-                    HEX_VERBOSE("ggml-hex: F16/F32 blocked scratch=%zu exceeds budget=%zu; use DDR panel\n",
+                    HEX_VERBOSE("ggml-hex: F16/F32 blocked layout or scratch ineligible (scratch=%zu budget=%zu); use DDR panel\n",
                                 packed_bytes, vtcm_budget);
                 }
                 return;

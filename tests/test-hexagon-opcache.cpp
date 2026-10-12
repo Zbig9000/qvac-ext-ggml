@@ -127,6 +127,10 @@ int main() {
     std::memcpy(blocked.kernel_params, &residual_kernel, sizeof(residual_kernel));
     CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-panel-4x2-add vtcm 0");
     CHECK(htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 36, 1188));
+    // A DDR F16 view can have an odd byte pitch. The blocked host route must
+    // use this same DSP predicate and retain DDR fallback for that layout.
+    CHECK(htp_mm_f16_f32_rows_fit(96, 9, 2, 2, 194, 1744));
+    CHECK(!htp_mm_f16_f32_rows_fit(96, 9, 2, 2, 193, 1736));
     CHECK(htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 44, 1444));
     CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 4, 44, 1443));
     CHECK(!htp_mm_f16_f32_rows_fit(9, 33, 4, 8, 36, 1188));

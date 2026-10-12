@@ -32,6 +32,7 @@ struct shape {
     bool extra_consumer = false;
     residual_layout residual_storage = residual_layout::contiguous;
     bool product_rounding = false;
+    size_t weight_byte_pitch = 0;
 };
 
 static const shape cases[] = {
@@ -107,6 +108,9 @@ static const shape cases[] = {
     {"ddr-residual-rounding",96,18,34,1,true,false,true,false,262112,true,false,false,false,residual_layout::contiguous,true},
     // Row-broadcast bias remains a standalone ADD for the multirow route.
     {"ddr-separate-bias",96,7,32769,1,false,true,true},
+    // Valid byte-strided F16 view: large N naturally selects DDR. Blocked
+    // reuse must retain the unaligned panel instead of failing DSP validation.
+    {"guard-odd-weight-pitch",96,9,32769,1,false,false,true,true,13,false,false,false,false,residual_layout::contiguous,false,193},
     // Ineligible shapes retain the existing F16-activation arithmetic.
     {"guard-k32",     32,  7,  5, 1, false, false, false},
     {"guard-batched", 96,  7,  5, 2, false, false, false},
@@ -237,9 +241,16 @@ static bool compute(ggml_backend_t backend, const shape & s, const inputs & in,
     if (!storage.ctx) return false;
     auto * ctx = storage.ctx;
     auto * graph = ggml_new_graph(ctx);
-    auto * a = ggml_new_tensor_3d(ctx, weight_type, s.k + (s.views ? s.weight_padding : 0), s.channels, s.batches);
+    const bool byte_pitched_weights = weight_type == GGML_TYPE_F16 && s.weight_byte_pitch != 0;
+    if (byte_pitched_weights && (s.batches != 1 || s.weight_byte_pitch < size_t(s.k) * sizeof(ggml_fp16_t))) return false;
+    const size_t weight_bytes = byte_pitched_weights
+        ? size_t(s.channels - 1) * s.weight_byte_pitch + size_t(s.k) * sizeof(ggml_fp16_t) : 0;
+    auto * a = byte_pitched_weights
+        ? ggml_new_tensor_1d(ctx, weight_type, (weight_bytes + sizeof(ggml_fp16_t) - 1) / sizeof(ggml_fp16_t))
+        : ggml_new_tensor_3d(ctx, weight_type, s.k + (s.views ? s.weight_padding : 0), s.channels, s.batches);
     auto * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, s.k + (s.views ? 11 : 0), s.rows, s.batches);
-    auto * av = s.views ? ggml_view_3d(ctx, a, s.k, s.channels, s.batches, a->nb[1], a->nb[2], a->nb[0]) : a;
+    auto * av = byte_pitched_weights ? ggml_view_2d(ctx, a, s.k, s.channels, s.weight_byte_pitch, 0)
+        : s.views ? ggml_view_3d(ctx, a, s.k, s.channels, s.batches, a->nb[1], a->nb[2], a->nb[0]) : a;
     auto * bv = s.views ? ggml_view_3d(ctx, b, s.k, s.rows, s.batches, b->nb[1], b->nb[2], b->nb[0]) : b;
     auto * product = ggml_mul_mat(ctx, av, bv);
     ggml_mul_mat_set_prec(product, GGML_PREC_F32);
@@ -284,7 +295,20 @@ static bool compute(ggml_backend_t backend, const shape & s, const inputs & in,
     }
     storage.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!storage.buffer) return false;
-    upload(a, in.weights, s.k, s.channels, s.batches, s.views ? 1 : 0);
+    if (byte_pitched_weights) {
+        // Copy bits at byte offsets without dereferencing an unaligned half.
+        // Unused bytes start with the F16 NaN representation 0xffff.
+        std::vector<uint8_t> bytes(ggml_nbytes(a), 0xff);
+        for (int c = 0; c < s.channels; ++c) {
+            for (int k = 0; k < s.k; ++k) {
+                const ggml_fp16_t half = ggml_fp32_to_fp16(in.weights[size_t(c) * s.k + k]);
+                std::memcpy(bytes.data() + size_t(c) * s.weight_byte_pitch + size_t(k) * sizeof(half), &half, sizeof(half));
+            }
+        }
+        ggml_backend_tensor_set(a, bytes.data(), 0, bytes.size());
+    } else {
+        upload(a, in.weights, s.k, s.channels, s.batches, s.views ? 1 : 0);
+    }
     upload(b, in.activations, s.k, s.rows, s.batches, s.views ? 1 : 0);
     if (bias) {
         std::vector<float> data(ggml_nelements(bias));
@@ -408,6 +432,9 @@ int main(int argc, char ** argv) {
     bool ok = !dev || hexagon;
     for (const auto & s : cases) {
         if (!selected_case.empty() && selected_case != s.name) continue;
+        if (s.weight_byte_pitch) {
+            std::printf("%s expected-route=hvx-panel-4x2 weight-byte-pitch=%zu\n", s.name, s.weight_byte_pitch);
+        }
         if (s.protect_matmul || s.extra_consumer || s.residual_storage != residual_layout::contiguous) {
             // --case and these tensor names permit a PROFILE=1 invocation
             // to check the actual route for each valid negative graph.
