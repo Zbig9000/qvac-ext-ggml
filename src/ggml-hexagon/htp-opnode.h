@@ -356,6 +356,12 @@ struct htp_opformat {
             const char * path = "unknown";
             int32_t type = kparams->kernel_type;
             if (type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED) {
+                if (kparams->pipeline != HTP_MM_F16_F32_BLOCKED_CHANNELS) {
+                    snprintf(str, max_size, "hvx-blocked-f32 channels %d rows %d vtcm %d traversal %s",
+                             kparams->m_chunk, kparams->n_chunk, kparams->vtcm_size,
+                             kparams->pipeline == HTP_MM_F16_F32_BLOCKED_ROWS ? "rows" : "matrix");
+                    return;
+                }
                 snprintf(str, max_size, "hvx-blocked-f32 channels %d rows %d vtcm %d",
                          kparams->m_chunk, kparams->n_chunk, kparams->vtcm_size);
                 return;

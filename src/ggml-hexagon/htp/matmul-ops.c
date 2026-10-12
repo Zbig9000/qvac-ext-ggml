@@ -395,8 +395,22 @@ static void hvx_mm_f16_f32_panel_4x2(unsigned int nth, unsigned int ith, void * 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
 }
 
-// Each worker owns complete channel tiles or activation row pairs. Its packed
-// tile lives across every assigned activation block, then is overwritten.
+static inline void hvx_mm_f16_f32_pack_rows(const struct htp_tensor * src0, uint32_t ksize,
+                                           uint32_t first, uint32_t count, float * packed) {
+    for (uint32_t c = 0; c < count; ++c) {
+        const uint8_t * w = (const uint8_t *) src0->data + (size_t) (first + c) * src0->nb[1];
+        HVX_Vector * out = (HVX_Vector *) (packed + (size_t) c * ksize);
+        for (uint32_t k = 0; k < ksize; k += VLEN_FP16) {
+            const HVX_VectorPair wide = panel_f16_weights(w + k * 2, ksize - k);
+            out[k / VLEN_FP32] = Q6_V_lo_W(wide);
+            if (ksize - k >= VLEN_FP16) out[k / VLEN_FP32 + 1] = Q6_V_hi_W(wide);
+        }
+    }
+}
+
+// Each worker owns complete channel tiles or activation row pairs. Channels
+// traversal retains one tile across all rows. Rows traversal repacks each tile
+// per row block; matrix traversal packs once and bounds the active output rows.
 static void hvx_mm_f16_f32_blocked_thread(unsigned int nth, unsigned int ith, void * data) {
     struct htp_ops_context * octx = data;
     htp_matmul_tensors_preamble;
@@ -417,51 +431,61 @@ static void hvx_mm_f16_f32_blocked_thread(unsigned int nth, unsigned int ith, vo
     const size_t worker_bytes = (size_t) p->vtcm_src0_size / nth;
     float * packed = (float *) ((uint8_t *) octx->ctx->vtcm_base + ith * worker_bytes);
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    for (uint32_t mc = mb; mc < me; mc += tile) {
-        const uint32_t count = MIN(tile, me - mc);
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, mc);
-        for (uint32_t c = 0; c < count; ++c) {
-            const uint8_t * w = (const uint8_t *) src0->data + (size_t) (mc + c) * nb01;
-            HVX_Vector * out = (HVX_Vector *) (packed + (size_t) c * ne00);
-            for (uint32_t k = 0; k < ne00; k += VLEN_FP16) {
-                const HVX_VectorPair wide = panel_f16_weights(w + k * 2, ne00 - k);
-                out[k / VLEN_FP32] = Q6_V_lo_W(wide);
-                if (ne00 - k >= VLEN_FP16) out[k / VLEN_FP32 + 1] = Q6_V_hi_W(wide);
+    const bool row_outer = p->pipeline != HTP_MM_F16_F32_BLOCKED_CHANNELS;
+    const bool matrix = p->pipeline == HTP_MM_F16_F32_BLOCKED_MATRIX;
+    if (matrix) {
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, mb);
+        hvx_mm_f16_f32_pack_rows(src0, ne00, mb, me - mb, packed);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, mb);
+    }
+    const uint32_t outer_end = row_outer ? ne : me;
+    const uint32_t outer_step = row_outer ? p->n_chunk : tile;
+    for (uint32_t outer = row_outer ? nb : mb; outer < outer_end; outer += outer_step) {
+        const uint32_t mc_begin = row_outer ? mb : outer;
+        const uint32_t mc_end = row_outer ? me : MIN(outer + tile, me);
+        const uint32_t rb_begin = row_outer ? outer : nb;
+        const uint32_t rb_end = row_outer ? MIN(outer + p->n_chunk, ne) : ne;
+        for (uint32_t mc = mc_begin; mc < mc_end; mc += tile) {
+            const uint32_t count = MIN(tile, mc_end - mc);
+            const float * tile_weights = matrix ? packed + (size_t) (mc - mb) * ne00 : packed;
+            if (!matrix) {
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, mc);
+                hvx_mm_f16_f32_pack_rows(src0, ne00, mc, count, packed);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, mc);
             }
-        }
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, mc);
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, mc);
-        for (uint32_t rb = nb; rb < ne; rb += p->n_chunk) {
-            const uint32_t re = MIN(rb + p->n_chunk, ne);
-            for (uint32_t r = rb; r < re; r += 2) {
-                const uint8_t * a0 = (const uint8_t *) src1->data + (size_t) r * nb11;
-                float * d0 = (float *) ((uint8_t *) dst->data + (size_t) r * nb1) + mc;
-                uint32_t c = 0;
-                if (r + 1 < re) {
-                    const uint8_t * a1 = a0 + nb11;
-                    float * d1 = (float *) ((uint8_t *) d0 + nb1);
-                    for (; c + 3 < count; c += 4) {
-                        const float * w = packed + (size_t) c * ne00;
-                        vec_dot_f32_packed_f32_4x2(ne00, d0 + c, d1 + c,
-                                                  w, w + ne00, w + 2 * ne00, w + 3 * ne00, a0, a1);
-                    }
-                    for (; c + 1 < count; c += 2) {
-                        const float * w = packed + (size_t) c * ne00;
-                        vec_dot_f32_packed_f32_2x2(ne00, d0 + c, d1 + c, w, w + ne00, a0, a1);
-                    }
-                    for (; c < count; ++c) {
-                        const float * w = packed + (size_t) c * ne00;
-                        vec_dot_f32_packed_f32_1x1(ne00, d0 + c, w, a0);
-                        vec_dot_f32_packed_f32_1x1(ne00, d1 + c, w, a1);
-                    }
-                } else {
-                    for (; c < count; ++c) {
-                        vec_dot_f32_packed_f32_1x1(ne00, d0 + c, packed + (size_t) c * ne00, a0);
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, mc);
+            for (uint32_t rb = rb_begin; rb < rb_end; rb += p->n_chunk) {
+                const uint32_t re = MIN(rb + p->n_chunk, rb_end);
+                for (uint32_t r = rb; r < re; r += 2) {
+                    const uint8_t * a0 = (const uint8_t *) src1->data + (size_t) r * nb11;
+                    float * d0 = (float *) ((uint8_t *) dst->data + (size_t) r * nb1) + mc;
+                    uint32_t c = 0;
+                    if (r + 1 < re) {
+                        const uint8_t * a1 = a0 + nb11;
+                        float * d1 = (float *) ((uint8_t *) d0 + nb1);
+                        for (; c + 3 < count; c += 4) {
+                            const float * w = tile_weights + (size_t) c * ne00;
+                            vec_dot_f32_packed_f32_4x2(ne00, d0 + c, d1 + c,
+                                                      w, w + ne00, w + 2 * ne00, w + 3 * ne00, a0, a1);
+                        }
+                        for (; c + 1 < count; c += 2) {
+                            const float * w = tile_weights + (size_t) c * ne00;
+                            vec_dot_f32_packed_f32_2x2(ne00, d0 + c, d1 + c, w, w + ne00, a0, a1);
+                        }
+                        for (; c < count; ++c) {
+                            const float * w = tile_weights + (size_t) c * ne00;
+                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, w, a0);
+                            vec_dot_f32_packed_f32_1x1(ne00, d1 + c, w, a1);
+                        }
+                    } else {
+                        for (; c < count; ++c) {
+                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, tile_weights + (size_t) c * ne00, a0);
+                        }
                     }
                 }
             }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, mc);
         }
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, mc);
     }
 }
 
@@ -475,7 +499,7 @@ static int hvx_mm_f16_f32_blocked(struct htp_ops_context * octx) {
         nb00 != 2 || nb10 != 4 || nb0 != 4 ||
         (size_t) nb01 < (size_t) ne00 * 2 || (size_t) nb11 < (size_t) ne10 * 4 || (size_t) nb1 < (size_t) ne01 * 4 ||
         (p->n_chunk != 32 && p->n_chunk != 64) ||
-        !htp_mm_f16_f32_blocked_scratch(ne00, ne01, p->m_chunk, octx->n_threads, &worker_bytes, &total) ||
+        !htp_mm_f16_f32_blocked_scratch_for_traversal(ne00, ne01, p->m_chunk, octx->n_threads, p->pipeline, &worker_bytes, &total) ||
         p->vtcm_size != (int32_t) total || p->vtcm_src0_size != (int32_t) total) return HTP_STATUS_NO_SUPPORT;
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) return HTP_STATUS_OK;
     if (octx->ctx->vtcm_size < total || !octx->ctx->vtcm_base ||

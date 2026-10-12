@@ -76,6 +76,7 @@ static int    opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_4X2;
 static int    opt_f16_f32_blocked = 0; // prototype; retain production DDR 4x2 default
 static int    opt_f16_f32_blocked_channels = 16;
 static int    opt_f16_f32_blocked_rows = 32;
+static int    opt_f16_f32_blocked_traversal = HTP_MM_F16_F32_BLOCKED_CHANNELS;
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -2787,16 +2788,17 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                 kparams->src1_row_size = src1->nb[1];
                 size_t worker_bytes = 0, packed_bytes = 0;
                 if (opt_f16_f32_blocked &&
-                    htp_mm_f16_f32_blocked_scratch(ne10, src0->ne[1], opt_f16_f32_blocked_channels,
-                                                 sess->n_threads, &worker_bytes, &packed_bytes) &&
+                    htp_mm_f16_f32_blocked_scratch_for_traversal(ne10, src0->ne[1], opt_f16_f32_blocked_channels,
+                                                 sess->n_threads, opt_f16_f32_blocked_traversal, &worker_bytes, &packed_bytes) &&
                     packed_bytes <= vtcm_budget) {
                     kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_BLOCKED;
                     kparams->m_chunk = opt_f16_f32_blocked_channels;
                     kparams->n_chunk = opt_f16_f32_blocked_rows;
+                    kparams->pipeline = opt_f16_f32_blocked_traversal;
                     kparams->vtcm_size = packed_bytes;
                     kparams->vtcm_src0_size = packed_bytes;
-                    HEX_VERBOSE("ggml-hex: F16/F32 blocked k=%d channels=%lld rows=%d tile=%d block=%d scratch=%zu\n",
-                                ne10, (long long) src0->ne[1], ne11, kparams->m_chunk, kparams->n_chunk, packed_bytes);
+                    HEX_VERBOSE("ggml-hex: F16/F32 blocked k=%d channels=%lld rows=%d tile=%d block=%d traversal=%d scratch=%zu\n",
+                                ne10, (long long) src0->ne[1], ne11, kparams->m_chunk, kparams->n_chunk, kparams->pipeline, packed_bytes);
                 } else if (opt_f16_f32_blocked) {
                     HEX_VERBOSE("ggml-hex: F16/F32 blocked scratch=%zu exceeds budget=%zu; use DDR panel\n",
                                 packed_bytes, vtcm_budget);
@@ -5129,8 +5131,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         else if (strcmp(blocked_rows, "64") == 0) opt_f16_f32_blocked_rows = 64;
         else GGML_LOG_WARN("ggml-hex: unsupported F16_F32_BLOCKED_ROWS=%s; using 32\n", blocked_rows);
     }
-    if (opt_f16_f32_blocked) GGML_LOG_INFO("ggml-hex: F16/F32 blocked prototype enabled (channels=%d rows=%d)\n",
-                                       opt_f16_f32_blocked_channels, opt_f16_f32_blocked_rows);
+    const char * blocked_traversal = getenv("GGML_HEXAGON_F16_F32_BLOCKED_TRAVERSAL");
+    if (blocked_traversal) {
+        if (strcmp(blocked_traversal, "channels") == 0) opt_f16_f32_blocked_traversal = HTP_MM_F16_F32_BLOCKED_CHANNELS;
+        else if (strcmp(blocked_traversal, "rows") == 0) opt_f16_f32_blocked_traversal = HTP_MM_F16_F32_BLOCKED_ROWS;
+        else if (strcmp(blocked_traversal, "matrix") == 0) opt_f16_f32_blocked_traversal = HTP_MM_F16_F32_BLOCKED_MATRIX;
+        else GGML_LOG_WARN("ggml-hex: unsupported F16_F32_BLOCKED_TRAVERSAL=%s; using channels\n", blocked_traversal);
+    }
+    if (opt_f16_f32_blocked) GGML_LOG_INFO("ggml-hex: F16/F32 blocked prototype enabled (channels=%d rows=%d traversal=%d)\n",
+                                       opt_f16_f32_blocked_channels, opt_f16_f32_blocked_rows, opt_f16_f32_blocked_traversal);
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;

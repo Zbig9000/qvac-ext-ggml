@@ -93,6 +93,26 @@ int main() {
     CHECK(!htp_mm_f16_f32_blocked_scratch(SIZE_MAX - 31, 17, 16, 6, &worker_bytes, &total_bytes));
     CHECK(!htp_mm_f16_f32_blocked_scratch(1u << 25, 17, 16, 6, &worker_bytes, &total_bytes));
 
+    blocked_kernel.pipeline = HTP_MM_F16_F32_BLOCKED_ROWS;
+    std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 vtcm 36864 traversal rows");
+    CHECK(htp_mm_f16_f32_blocked_scratch_for_traversal(384, 384, 16, 6,
+        HTP_MM_F16_F32_BLOCKED_MATRIX, &worker_bytes, &total_bytes));
+    CHECK(worker_bytes == 589824 && total_bytes == 3538944 && worker_bytes % 128 == 0);
+    blocked_kernel.pipeline = HTP_MM_F16_F32_BLOCKED_MATRIX;
+    blocked_kernel.vtcm_size = total_bytes;
+    std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 vtcm 3538944 traversal matrix");
+    CHECK(htp_mm_f16_f32_blocked_scratch_for_traversal(384, 384, 16, 6,
+        HTP_MM_F16_F32_BLOCKED_ROWS, &worker_bytes, &total_bytes));
+    CHECK(worker_bytes == 24576 && total_bytes == 147456);
+    CHECK(!htp_mm_f16_f32_blocked_scratch_for_traversal(96, 17, 16, 6, 3, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch_for_traversal(96, 17, 16, 6, -1, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch_for_traversal(384, SIZE_MAX, 16, 6,
+        HTP_MM_F16_F32_BLOCKED_MATRIX, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch_for_traversal(384, 1u << 20, 16, 6,
+        HTP_MM_F16_F32_BLOCKED_MATRIX, &worker_bytes, &total_bytes));
+
     htp_op_cache cache;
     CHECK(cache.size() == 0);
     cache.resize(3);

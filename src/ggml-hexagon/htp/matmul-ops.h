@@ -117,17 +117,34 @@ static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_par
 _Static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_params is too large for kernel_params blob");
 #endif
 
+// The blocked route carries traversal in the otherwise unused pipeline field.
+enum htp_mm_f16_f32_blocked_traversal {
+    HTP_MM_F16_F32_BLOCKED_CHANNELS = 0,
+    HTP_MM_F16_F32_BLOCKED_ROWS = 1,
+    HTP_MM_F16_F32_BLOCKED_MATRIX = 2,
+};
+
 // Channel-major F32 rows are 128-byte aligned because K is a multiple of 32.
 // Shared by host dispatch and DSP validation; no tensor-lifetime weight cache.
+static inline bool htp_mm_f16_f32_blocked_scratch_for_traversal(size_t k, size_t channels,
+                                                size_t tile, size_t threads, int traversal,
+                                                size_t * per_worker, size_t * total) {
+    if (k < 64 || k % 32 || channels < 2 || !threads ||
+        (tile != 8 && tile != 16 && tile != 32) ||
+        traversal < HTP_MM_F16_F32_BLOCKED_CHANNELS || traversal > HTP_MM_F16_F32_BLOCKED_MATRIX) return false;
+    const size_t packed_channels = traversal == HTP_MM_F16_F32_BLOCKED_MATRIX
+        ? channels : hex_smin(channels, tile);
+    size_t row_bytes;
+    return !hex_mul_overflow(k, sizeof(float), &row_bytes) &&
+           !hex_mul_overflow(packed_channels, row_bytes, per_worker) &&
+           !hex_mul_overflow(*per_worker, threads, total) && *total <= INT32_MAX;
+}
+
 static inline bool htp_mm_f16_f32_blocked_scratch(size_t k, size_t channels,
                                                 size_t tile, size_t threads,
                                                 size_t * per_worker, size_t * total) {
-    if (k < 64 || k % 32 || channels < 2 || !threads ||
-        (tile != 8 && tile != 16 && tile != 32)) return false;
-    size_t row_bytes;
-    return !hex_mul_overflow(k, sizeof(float), &row_bytes) &&
-           !hex_mul_overflow(hex_smin(channels, tile), row_bytes, per_worker) &&
-           !hex_mul_overflow(*per_worker, threads, total) && *total <= INT32_MAX;
+    return htp_mm_f16_f32_blocked_scratch_for_traversal(k, channels, tile, threads,
+        HTP_MM_F16_F32_BLOCKED_CHANNELS, per_worker, total);
 }
 
 struct mmid_row_mapping {
