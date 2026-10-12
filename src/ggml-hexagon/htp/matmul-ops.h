@@ -72,6 +72,9 @@ enum htp_mm_kernel_type {
 
     // Small-K convolution lowering: SIMD lanes span independent output rows.
     HTP_MM_KERNEL_HVX_F16_F16_K9,
+
+    // Opt-in per-operation F32 weight packing for DDR activation panels.
+    HTP_MM_KERNEL_HVX_F16_F32_BLOCKED,
 };
 
 // Op-specific struct for precomputed matmul params
@@ -113,6 +116,19 @@ static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_par
 #else
 _Static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_params is too large for kernel_params blob");
 #endif
+
+// Channel-major F32 rows are 128-byte aligned because K is a multiple of 32.
+// Shared by host dispatch and DSP validation; no tensor-lifetime weight cache.
+static inline bool htp_mm_f16_f32_blocked_scratch(size_t k, size_t channels,
+                                                size_t tile, size_t threads,
+                                                size_t * per_worker, size_t * total) {
+    if (k < 64 || k % 32 || channels < 2 || !threads ||
+        (tile != 8 && tile != 16 && tile != 32)) return false;
+    size_t row_bytes;
+    return !hex_mul_overflow(k, sizeof(float), &row_bytes) &&
+           !hex_mul_overflow(hex_smin(channels, tile), row_bytes, per_worker) &&
+           !hex_mul_overflow(*per_worker, threads, total) && *total <= INT32_MAX;
+}
 
 struct mmid_row_mapping {
     uint32_t i1;

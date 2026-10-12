@@ -68,6 +68,16 @@ static const shape cases[] = {
     // idle workers, half-vector tails and panel remainders.
     {"ddr-split-channels", 96, 22, 3, 1, true, false, true, false, 262112},
     {"ddr-split-varied",   96, 29, 3, 1, true, false, true, true,  262112},
+    // Natural DDR dispatch with tiny logical rows checks channel tile and
+    // activation block boundaries (8/16/32 channels and 32/64 rows). Padding
+    // stays NaN-filled and all reference tolerances remain unchanged.
+    {"ddr-tile8-row31",   96,  9, 31, 1, true, false, true, true, 262112},
+    {"ddr-tile16-row32",  96, 16, 32, 1, true, false, true, true, 262112},
+    {"ddr-tile17-row33",  96, 17, 33, 1, true, false, true, false,262112},
+    {"ddr-tile31-row63",  96, 31, 63, 1, true, false, true, true, 262112},
+    {"ddr-tile32-row64",  96, 32, 64, 1, true, false, true, true, 262112},
+    {"ddr-tile33-row65",  96, 33, 65, 1, true, false, true, false,262112},
+    {"ddr-tile65-idle",   96, 65,  3, 1, true, false, true, true, 262112},
     // Ineligible shapes retain the existing F16-activation arithmetic.
     {"guard-k32",     32,  7,  5, 1, false, false, false},
     {"guard-batched", 96,  7,  5, 2, false, false, false},

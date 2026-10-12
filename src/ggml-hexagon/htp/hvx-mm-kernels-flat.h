@@ -1328,6 +1328,80 @@ static inline void vec_dot_f16_f32_uu_4x2(const uint32_t n, float * restrict s0,
     hvx_vec_store_u(s1 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum21, sum31));
 }
 
+// Packed weights retain the original 32-lane contribution order. Separate
+// multiply/add intrinsics and the same reduction preserve DDR panel arithmetic.
+static inline void vec_dot_f32_packed_f32_4x2(const uint32_t n, float * restrict s0, float * restrict s1,
+                                        const void * restrict vx0, const void * restrict vx1,
+                                        const void * restrict vx2, const void * restrict vx3,
+                                        const void * restrict vy0, const void * restrict vy1) {
+    const uint8_t * x0 = vx0;
+    const uint8_t * x1 = vx1;
+    const uint8_t * x2 = vx2;
+    const uint8_t * x3 = vx3;
+    const uint8_t * y0 = vy0;
+    const uint8_t * y1 = vy1;
+    HVX_Vector sum00 = Q6_V_vzero(), sum01 = Q6_V_vzero();
+    HVX_Vector sum10 = Q6_V_vzero(), sum11 = Q6_V_vzero();
+    HVX_Vector sum20 = Q6_V_vzero(), sum21 = Q6_V_vzero();
+    HVX_Vector sum30 = Q6_V_vzero(), sum31 = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP32) {
+        const HVX_Vector w0 = *(const HVX_Vector *) (x0 + k * 4);
+        const HVX_Vector w1 = *(const HVX_Vector *) (x1 + k * 4);
+        const HVX_Vector w2 = *(const HVX_Vector *) (x2 + k * 4);
+        const HVX_Vector w3 = *(const HVX_Vector *) (x3 + k * 4);
+        HVX_Vector a0 = hvx_vmemu(y0 + k * 4);
+        HVX_Vector a1 = hvx_vmemu(y1 + k * 4);
+        sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(w0, a0));
+        sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(w0, a1));
+        sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(w1, a0));
+        sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(w1, a1));
+        sum20 = HVX_OP_ADD_F32(sum20, HVX_OP_MUL_F32(w2, a0));
+        sum21 = HVX_OP_ADD_F32(sum21, HVX_OP_MUL_F32(w2, a1));
+        sum30 = HVX_OP_ADD_F32(sum30, HVX_OP_MUL_F32(w3, a0));
+        sum31 = HVX_OP_ADD_F32(sum31, HVX_OP_MUL_F32(w3, a1));
+    }
+    hvx_vec_store_u(s0, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum00, sum10));
+    hvx_vec_store_u(s0 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum20, sum30));
+    hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
+    hvx_vec_store_u(s1 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum21, sum31));
+}
+
+static inline void vec_dot_f32_packed_f32_2x2(const uint32_t n, float * restrict s0, float * restrict s1,
+                                        const void * restrict vx0, const void * restrict vx1,
+                                        const void * restrict vy0, const void * restrict vy1) {
+    const uint8_t * x0 = vx0;
+    const uint8_t * x1 = vx1;
+    const uint8_t * y0 = vy0;
+    const uint8_t * y1 = vy1;
+    HVX_Vector sum00 = Q6_V_vzero(), sum10 = Q6_V_vzero();
+    HVX_Vector sum01 = Q6_V_vzero(), sum11 = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP32) {
+        const HVX_Vector w0 = *(const HVX_Vector *) (x0 + k * 4);
+        const HVX_Vector w1 = *(const HVX_Vector *) (x1 + k * 4);
+        HVX_Vector a0 = hvx_vmemu(y0 + k * 4);
+        HVX_Vector a1 = hvx_vmemu(y1 + k * 4);
+        sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(w0, a0));
+        sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(w1, a0));
+        sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(w0, a1));
+        sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(w1, a1));
+
+    }
+    hvx_vec_store_u(s0, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum00, sum10));
+    hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
+}
+
+
+static inline void vec_dot_f32_packed_f32_1x1(const uint32_t n, float * restrict s,
+                                             const void * restrict vx, const void * restrict vy) {
+    const HVX_Vector * x = vx;
+    const uint8_t * y = vy;
+    HVX_Vector sum = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP32) {
+        sum = HVX_OP_ADD_F32(sum, HVX_OP_MUL_F32(x[k / VLEN_FP32], hvx_vmemu(y + k * 4)));
+    }
+    hvx_vec_store_u(s, sizeof(float), hvx_vec_reduce_sum_f32(sum));
+}
+
 #undef HVX_OP_ADD_F32
 #undef HVX_OP_MUL_F32
 

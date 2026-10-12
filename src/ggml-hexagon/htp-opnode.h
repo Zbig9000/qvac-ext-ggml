@@ -355,6 +355,11 @@ struct htp_opformat {
             const auto * kparams = (const struct htp_mm_kernel_params *) node.kernel_params;
             const char * path = "unknown";
             int32_t type = kparams->kernel_type;
+            if (type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED) {
+                snprintf(str, max_size, "hvx-blocked-f32 channels %d rows %d vtcm %d",
+                         kparams->m_chunk, kparams->n_chunk, kparams->vtcm_size);
+                return;
+            }
             if (type == HTP_MM_KERNEL_HMX_2D || type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
                 path = "hmx-tiled";
             } else if (type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||

@@ -73,6 +73,26 @@ int main() {
     htp_opnode plain(mm, {}, HTP_OP_MUL_MAT);
     std::memcpy(plain.kernel_params, &kernel, sizeof(kernel));
 
+    // The blocked tag must remain visible to route guards in profile output.
+    htp_opnode blocked = plain;
+    htp_mm_kernel_params blocked_kernel = {};
+    blocked_kernel.kernel_type = HTP_MM_KERNEL_HVX_F16_F32_BLOCKED;
+    blocked_kernel.m_chunk = 16;
+    blocked_kernel.n_chunk = 32;
+    size_t worker_bytes = 0, total_bytes = 0;
+    CHECK(htp_mm_f16_f32_blocked_scratch(96, 17, 16, 6, &worker_bytes, &total_bytes));
+    CHECK(worker_bytes == 6144 && total_bytes == 36864 && worker_bytes % 128 == 0);
+    blocked_kernel.vtcm_size = total_bytes;
+    std::memcpy(blocked.kernel_params, &blocked_kernel, sizeof(blocked_kernel));
+    CHECK(std::string(htp_opformat(blocked).kparams) == "hvx-blocked-f32 channels 16 rows 32 vtcm 36864");
+    CHECK(htp_mm_f16_f32_blocked_scratch(96, 7, 16, 6, &worker_bytes, &total_bytes));
+    CHECK(worker_bytes == 2688 && total_bytes == 16128);
+    CHECK(!htp_mm_f16_f32_blocked_scratch(97, 17, 16, 6, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch(96, 17, 12, 6, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch(96, 17, 16, 0, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch(SIZE_MAX - 31, 17, 16, 6, &worker_bytes, &total_bytes));
+    CHECK(!htp_mm_f16_f32_blocked_scratch(1u << 25, 17, 16, 6, &worker_bytes, &total_bytes));
+
     htp_op_cache cache;
     CHECK(cache.size() == 0);
     cache.resize(3);
