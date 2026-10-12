@@ -825,6 +825,14 @@ evidence only; performance claims use the validated October 8 suite.
 The new routes are experimental and disabled by default; the compiled DDR
 panel remains 4x2. Each optimization can be measured independently.
 
+A fresh 4x2 PROFILE=1 S1 capture attributes 85.73% of leaf DSP cycles to
+MUL_MAT and 5.63% to ADD. The K96/output96, K192/output192 and
+K384/output384 codec families together account for 67.19%. A separate matrix
+reuse capture leaves ADD at approximately 6.20% of leaf cycles, supporting
+the residual epilogue experiment. These shares include operation execution
+setup and are not percentages of application wall time. They do not isolate
+weight conversion, cache misses or DDR bandwidth.
+
 | Control | Values | Default |
 | --- | --- | --- |
 | `GGML_HEXAGON_F16_F32_BLOCKED` | `0`, `1` | `0` |
@@ -873,6 +881,12 @@ equivalence. The separate 66-frame profile confirms 56 fused codec operations
 for both fusion-only and combined. Shape-derived traffic is logical bytes,
 not measured DDR bandwidth.
 
+Those 56 outputs total 609,878,016 F32 elements: 18 at 384x16896, one at
+768x16896, 19 at 192x67584 and 18 at 96x135168. Eliminating each intermediate
+write and subsequent read corresponds to 4,879,024,128 logical bytes per
+66-frame decode. Actual physical traffic depends on the cache hierarchy and
+was not measured with hardware counters.
+
 The existing model-backed harness passes at 3 frames. With cap 66 its CPU
 trajectory reaches EOS at 26 and reports seven language-model numeric
 threshold failures. Baseline and reuse have identical failure records, zero
@@ -892,12 +906,118 @@ The full comparison uses 4x2, reuse-only, fusion-only and combined on S1-S5:
 greedy seed 42, four CPU threads, six HVX workers, three warmups plus five
 timed observations with rotating order. Profiling is off, OPSTAGE 3 computes
 the work, artifacts/models are pinned, thermal status 0 is required before
-timing, and codes/WAVs must match across variants and repeats. This final
-suite is running on the reconnected OnePlus. No full-suite gain is claimed
-until all measurements and artifact checks are complete.
+timing, and codes/WAVs must match across variants and repeats. The complete
+suite and its strictly validated results are reported below.
 
 Evidence beside the checkout: `hexagon-26841-build/results/` (including
 `matrix-kernels-full-a/summary.json` and `fusion-fixed-final-b/summary.json`),
 `hexagon-26841-build/assembly/fusion/provenance.json`, and frozen `stage/`
 artifacts. Device raw results: `/data/local/tmp/qvac-26841/results/`.
 Task: https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219396967417382.
+
+### Four-variant end-to-end measurements, October 12
+
+OnePlus 13s / SM8750 / v79, six HVX workers and four CPU threads. Every
+variant has three fresh-process warmup captures and five timed captures for
+each prompt, in rotating order. Profiling is off and OPSTAGE=3. Thermal
+status 0 is required before each capture; post-run status may increase.
+All 160 captures have valid geometry, backend/worker/enable records and
+identical codes/WAV across variants and repetitions for their prompt.
+Runtime hashes match the pinned artifacts and were checked again after the
+end-to-end suite. S4 reaches its 70-frame cap.
+
+The table reports median inference / codec synthesis in seconds. Loading
+and output file I/O are excluded from inference.
+
+| Prompt | Frames | 4x2 baseline | Reuse only | Fusion only | Reuse + fusion |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S1 | 66 | 15.6055 / 3.1031 | 13.5930 / 4.0341 | 15.4613 / 5.6839 | 14.8563 / 3.5360 |
+| S2 | 55 | 11.1336 / 2.5306 | 14.1089 / 4.2445 | 13.5865 / 5.5199 | 12.5642 / 3.8144 |
+| S3 | 70 | 14.9305 / 6.0057 | 14.4205 / 4.4458 | 15.3639 / 4.6276 | 14.4814 / 5.4506 |
+| S4 | 70 | 15.2291 / 5.3148 | 13.9132 / 5.4535 | 15.5647 / 7.0429 | 14.2548 / 6.6874 |
+| S5 | 94 | 18.4920 / 8.0442 | 21.1038 / 7.2672 | 20.2864 / 4.4903 | 19.1223 / 5.0637 |
+
+Ranges and inference RTF below use the same five timed observations. These
+ranges are observed minima/maxima, not confidence intervals.
+
+| Prompt | Variant | Inference range (s) | Codec range (s) | Median inference RTF | Timed post-run thermal states |
+| --- | --- | ---: | ---: | ---: | --- |
+| S1 | 4x2 | 13.4016-18.3262 | 2.2108-5.8977 | 5.0915 | 0, 0, 0, 0, 0 |
+| S1 | reuse | 12.6501-16.1472 | 1.8394-5.2461 | 4.4349 | 0, 0, 0, 0, 0 |
+| S1 | fusion only | 12.0850-18.0866 | 2.9228-6.9973 | 5.0444 | 0, 0, 0, 0, 0 |
+| S1 | combined | 13.7264-18.9362 | 1.4555-6.6656 | 4.8470 | 0, 0, 0, 0, 0 |
+| S2 | 4x2 | 10.0010-12.7708 | 1.4987-4.7947 | 4.3589 | 0, 1, 0, 0, 0 |
+| S2 | reuse | 9.1255-14.5445 | 1.8386-4.5027 | 5.5238 | 0, 0, 0, 0, 0 |
+| S2 | fusion only | 9.7553-15.5507 | 2.3816-5.5899 | 5.3193 | 0, 0, 0, 0, 0 |
+| S2 | combined | 10.9137-15.0892 | 2.3013-5.2719 | 4.9190 | 0, 0, 0, 0, 0 |
+| S3 | 4x2 | 12.2650-19.0916 | 2.5246-6.0090 | 4.5929 | 0, 1, 0, 0, 0 |
+| S3 | reuse | 12.5263-17.4752 | 2.3011-5.4331 | 4.4360 | 1, 0, 0, 0, 1 |
+| S3 | fusion only | 11.7670-20.7434 | 2.4725-7.1152 | 4.7262 | 0, 0, 0, 0, 0 |
+| S3 | combined | 13.5180-14.6611 | 4.0129-6.7058 | 4.4547 | 0, 0, 0, 0, 0 |
+| S4 | 4x2 | 13.1606-15.8014 | 3.8945-6.0809 | 4.6847 | 0, 0, 0, 0, 0 |
+| S4 | reuse | 13.3911-17.3646 | 3.0742-5.7295 | 4.2799 | 1, 0, 0, 0, 0 |
+| S4 | fusion only | 12.4300-18.3670 | 3.1077-7.0569 | 4.7880 | 0, 0, 1, 0, 0 |
+| S4 | combined | 11.2475-18.0721 | 1.7781-7.0477 | 4.3850 | 0, 0, 0, 0, 0 |
+| S5 | 4x2 | 17.3044-23.4721 | 8.0005-8.0745 | 4.2361 | 1, 0, 0, 0, 1 |
+| S5 | reuse | 17.0552-24.1888 | 3.5401-7.3019 | 4.8344 | 0, 0, 1, 0, 0 |
+| S5 | fusion only | 19.0983-24.9814 | 4.2262-9.4213 | 4.6471 | 0, 0, 1, 0, 0 |
+| S5 | combined | 18.8636-25.7329 | 2.9809-9.0443 | 4.3805 | 0, 0, 0, 0, 0 |
+
+The sums of per-prompt medians are derived summaries, not a new measured
+run: baseline/reuse/fusion-only/combined inference is
+75.3907 / 77.1394 / 80.2628 / 75.2790 s; codec is
+24.9984 / 25.4451 / 27.3646 / 24.5521 s. Combined is only 0.15% lower in
+inference and 1.79% lower in codec by this summary. Reuse-only is 2.32%
+higher in inference and 1.79% higher in codec; fusion-only is 6.46% and 9.47%
+higher. Prompt-level regressions and wide spreads prevent a repeatable
+speedup claim. Retain the compiled 4x2 default and keep both prototypes
+opt-in.
+
+Decoder-only fixed-code timings below isolate codec execution from
+language-model timing variation.
+
+Strict raw records and validation: `hexagon-26841-build/results/suite-final-a/summary.json`.
+Runtime/source manifests: `hexagon-26841-build/final-provenance.json`.
+Model hashes are the same pinned files listed earlier in this guide.
+The CLI comes from speech source `30e04b00`; runtime source heads are
+`74861e5e` (baseline), `6c198659` (reuse only), and `ab3ee187` (fusion-only
+and combined). Matching host/DSP artifacts are retained under `stage/`.
+Independent review verifies manifest/variant/worker checks and rejects all
+18 deliberately invalid local fixtures.
+
+
+### Fixed-code decoder-only measurements, October 12
+
+All 64 captures pass strict backend/flag/hardware, timing, finite F32 PCM,
+RIFF format/geometry, thermal and pinned-runtime validation. Raw F32 PCM
+and WAV bytes match baseline across all variants and captures at each length.
+Each variant/length has three fresh-process warmup captures and five timed
+captures in rotating order. The full decoder call includes latent processing,
+graph setup, synthesis and PCM readback; the generation CLI reports latent and synthesis
+as separate stages. Model load, input validation and file I/O are excluded.
+
+| Frames | Variant | Median decoder (s) | Observed range (s) | Change vs 4x2 | Median decoder RTF | Timed post-run thermal states |
+| ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 66 | 4x2 | 4.055047 | 2.033156-5.906235 | +0.00% | 1.3230 | 0, 0, 0, 0, 0 |
+| 66 | reuse | 2.920937 | 2.011317-5.442260 | -27.97% | 0.9530 | 0, 0, 0, 0, 0 |
+| 66 | fusion only | 4.272690 | 2.689999-7.011464 | +5.37% | 1.3940 | 0, 1, 0, 0, 1 |
+| 66 | combined | 2.285171 | 2.043506-3.477122 | -43.65% | 0.7456 | 0, 0, 0, 0, 0 |
+| 94 | 4x2 | 6.086403 | 2.970825-8.318652 | +0.00% | 1.3943 | 0, 1, 0, 1, 0 |
+| 94 | reuse | 4.383213 | 3.902720-7.419366 | -27.98% | 1.0041 | 0, 0, 0, 0, 0 |
+| 94 | fusion only | 5.655863 | 2.862561-9.635843 | -7.07% | 1.2956 | 0, 0, 0, 0, 0 |
+| 94 | combined | 6.203125 | 2.899329-9.247434 | +1.92% | 1.4210 | 0, 0, 0, 0, 0 |
+
+Reuse medians are approximately 28% lower at both lengths, but observed
+ranges overlap and these five observations do not establish a repeatable
+application gain. Fusion-only is mixed; combined is 43.65% lower at 66
+frames and 1.92% higher at 94. The full-inference suite also has prompt-level
+regressions and substantial variation. Both prototypes remain opt-in; the
+compiled default is 4x2. Further tuning/default promotion requires stable
+matched measurements with no material suite regression.
+
+Strict raw records and validation: `hexagon-26841-build/results/codec-perf-final-a/summary.json`.
+Matching runners and validators are retained beside the checkout under
+`hexagon-26841-build/stage/`, `summarize-four-variants.py`,
+`summarize-codec-perf.py` and `suite-validation.py`; their hashes are recorded
+in `final-provenance.json`. Runtime artifacts were checked again after the
+decoder-only suite.
