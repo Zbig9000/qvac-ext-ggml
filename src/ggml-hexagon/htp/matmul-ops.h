@@ -72,6 +72,13 @@ enum htp_mm_kernel_type {
 
     // Small-K convolution lowering: SIMD lanes span independent output rows.
     HTP_MM_KERNEL_HVX_F16_F16_K9,
+
+    // Opt-in per-operation F32 weight packing for DDR activation panels.
+    HTP_MM_KERNEL_HVX_F16_F32_BLOCKED,
+    // Full-size F32 residual, added after the blocked reduction before DDR store.
+    HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD,
+    // Same residual epilogue on the existing DDR 4x2 route, without packing.
+    HTP_MM_KERNEL_HVX_F16_F32_DDR_ADD,
 };
 
 // Op-specific struct for precomputed matmul params
@@ -113,6 +120,63 @@ static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_par
 #else
 _Static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_params is too large for kernel_params blob");
 #endif
+
+// The blocked route carries traversal in the otherwise unused pipeline field.
+enum htp_mm_f16_f32_blocked_traversal {
+    HTP_MM_F16_F32_BLOCKED_CHANNELS = 0,
+    HTP_MM_F16_F32_BLOCKED_ROWS = 1,
+    HTP_MM_F16_F32_BLOCKED_MATRIX = 2,
+};
+
+// Channel-major F32 rows are 128-byte aligned because K is a multiple of 32.
+// Shared by host dispatch and DSP validation; no tensor-lifetime weight cache.
+static inline bool htp_mm_f16_f32_blocked_scratch_for_traversal(size_t k, size_t channels,
+                                                size_t tile, size_t threads, int traversal,
+                                                size_t * per_worker, size_t * total) {
+    if (k < 64 || k % 32 || channels < 2 || !threads ||
+        (tile != 8 && tile != 16 && tile != 32) ||
+        traversal < HTP_MM_F16_F32_BLOCKED_CHANNELS || traversal > HTP_MM_F16_F32_BLOCKED_MATRIX) return false;
+    const size_t packed_channels = traversal == HTP_MM_F16_F32_BLOCKED_MATRIX
+        ? channels : hex_smin(channels, tile);
+    size_t row_bytes;
+    return !hex_mul_overflow(k, sizeof(float), &row_bytes) &&
+           !hex_mul_overflow(packed_channels, row_bytes, per_worker) &&
+           !hex_mul_overflow(*per_worker, threads, total) && *total <= INT32_MAX;
+}
+
+static inline bool htp_mm_f16_f32_blocked_scratch(size_t k, size_t channels,
+                                                size_t tile, size_t threads,
+                                                size_t * per_worker, size_t * total) {
+    return htp_mm_f16_f32_blocked_scratch_for_traversal(k, channels, tile, threads,
+        HTP_MM_F16_F32_BLOCKED_CHANNELS, per_worker, total);
+}
+
+// Logical 2D rows must fit the descriptor, including strided input views.
+// Shared by host eligibility and DSP validation before any packed/kernel load.
+static inline bool htp_mm_f16_f32_rows_fit(size_t columns, size_t rows, size_t element_bytes,
+                                         size_t nb0, size_t nb1, size_t bytes) {
+    size_t width, offset, extent;
+    return columns && rows && element_bytes && columns <= UINT32_MAX && rows <= UINT32_MAX &&
+           nb0 == element_bytes && nb1 <= UINT32_MAX && nb1 % element_bytes == 0 &&
+           !hex_mul_overflow(columns, element_bytes, &width) && nb1 >= width &&
+           !hex_mul_overflow(rows - 1, nb1, &offset) &&
+           !hex_add_overflow(offset, width, &extent) && extent <= bytes && bytes <= UINT32_MAX;
+}
+
+static inline bool htp_mm_f16_f32_disjoint(uintptr_t a, size_t a_bytes, uintptr_t b, size_t b_bytes) {
+    return a && b && a_bytes && b_bytes && a_bytes <= UINTPTR_MAX - a && b_bytes <= UINTPTR_MAX - b &&
+           (a + a_bytes <= b || b + b_bytes <= a);
+}
+
+// Callers also require matching full shapes and contiguous F32 row strides.
+// Only exact residual storage reuse is safe; shifted/partial overlap is not.
+static inline bool htp_mm_f16_f32_residual_alias_ok(uintptr_t dst, size_t dst_bytes,
+                                                  uintptr_t residual, size_t residual_bytes) {
+    return dst && residual && dst_bytes && residual_bytes &&
+           dst_bytes <= UINTPTR_MAX - dst && residual_bytes <= UINTPTR_MAX - residual &&
+           ((dst == residual && dst_bytes == residual_bytes) ||
+            htp_mm_f16_f32_disjoint(dst, dst_bytes, residual, residual_bytes));
+}
 
 struct mmid_row_mapping {
     uint32_t i1;

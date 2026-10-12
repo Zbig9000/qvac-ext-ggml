@@ -1231,8 +1231,31 @@ static inline HVX_VectorPair panel_f16_weights(const uint8_t * row, uint32_t rem
     return hvx_vec_f16_to_f32(packed); // upper F32 vector is unused for a half-vector tail
 }
 
-static inline void vec_dot_f16_f32_panel_1x1(const uint32_t n, float * restrict s,
-                                           const void * restrict vx, const void * restrict vy) {
+// The product is already rounded to F32 by the unchanged reduction. Load
+// only the 1/2 valid residual cells, apply the standalone ADD intrinsic, then
+// store once. Exact dst/residual alias is safe because all loads precede store.
+static inline void vec_store_f32_residual(float * dst, uint32_t cells, HVX_Vector product,
+                                         const float * residual, struct htp_thread_trace * tr) {
+    if (residual) {
+        // Qualcomm can fold QF32 -> SF into the following ADD. The standalone
+        // product store rounds here; retain that boundary in an HVX register.
+        __asm__ volatile("" : "+v"(product));
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, cells);
+        HVX_Vector z = hvx_vec_splat_f32(residual[0]);
+        if (cells == 2) {
+            z = Q6_V_valign_VVR(hvx_vec_splat_f32(residual[1]), z, VLEN - sizeof(float));
+        }
+        product = hvx_vec_add_f32_f32(product, z);
+        hvx_vec_store_u(dst, cells * sizeof(float), product);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, cells);
+    } else {
+        hvx_vec_store_u(dst, cells * sizeof(float), product);
+    }
+}
+
+static inline void vec_dot_f16_f32_panel_1x1_residual(const uint32_t n, float * s,
+                                           const void * restrict vx, const void * restrict vy,
+                                           const float * z, struct htp_thread_trace * tr) {
     const uint8_t * x = vx;
     const uint8_t * y = vy;
     HVX_Vector sum = Q6_V_vzero();
@@ -1243,12 +1266,13 @@ static inline void vec_dot_f16_f32_panel_1x1(const uint32_t n, float * restrict 
             sum = HVX_OP_ADD_F32(sum, HVX_OP_MUL_F32(Q6_V_hi_W(w), hvx_vmemu(y + (k + VLEN_FP32) * 4)));
         }
     }
-    hvx_vec_store_u(s, sizeof(float), hvx_vec_reduce_sum_f32(sum));
+    vec_store_f32_residual(s, 1, hvx_vec_reduce_sum_f32(sum), z, tr);
 }
 
-static inline void vec_dot_f16_f32_uu_2x2(const uint32_t n, float * restrict s0, float * restrict s1,
+static inline void vec_dot_f16_f32_uu_2x2_residual(const uint32_t n, float * s0, float * s1,
                                         const void * restrict vx0, const void * restrict vx1,
-                                        const void * restrict vy0, const void * restrict vy1) {
+                                        const void * restrict vy0, const void * restrict vy1,
+                                        const float * z0, const float * z1, struct htp_thread_trace * tr) {
     const uint8_t * x0 = vx0;
     const uint8_t * x1 = vx1;
     const uint8_t * y0 = vy0;
@@ -1273,17 +1297,18 @@ static inline void vec_dot_f16_f32_uu_2x2(const uint32_t n, float * restrict s0,
             sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(Q6_V_hi_W(w1), a1));
         }
     }
-    hvx_vec_store_u(s0, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum00, sum10));
-    hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
+    vec_store_f32_residual(s0, 2, hvx_vec_reduce_sum_f32x2(sum00, sum10), z0, tr);
+    vec_store_f32_residual(s1, 2, hvx_vec_reduce_sum_f32x2(sum01, sum11), z1, tr);
 }
 
 
 // Four weight rows share each pair of F32 activation vectors. Each output
 // retains the 2x2 kernel's low-then-high accumulation and pairwise reduction.
-static inline void vec_dot_f16_f32_uu_4x2(const uint32_t n, float * restrict s0, float * restrict s1,
+static inline void vec_dot_f16_f32_uu_4x2_residual(const uint32_t n, float * s0, float * s1,
                                         const void * restrict vx0, const void * restrict vx1,
                                         const void * restrict vx2, const void * restrict vx3,
-                                        const void * restrict vy0, const void * restrict vy1) {
+                                        const void * restrict vy0, const void * restrict vy1,
+                                        const float * z0, const float * z1, struct htp_thread_trace * tr) {
     const uint8_t * x0 = vx0;
     const uint8_t * x1 = vx1;
     const uint8_t * x2 = vx2;
@@ -1322,10 +1347,102 @@ static inline void vec_dot_f16_f32_uu_4x2(const uint32_t n, float * restrict s0,
             sum31 = HVX_OP_ADD_F32(sum31, HVX_OP_MUL_F32(Q6_V_hi_W(w3), a1));
         }
     }
-    hvx_vec_store_u(s0, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum00, sum10));
-    hvx_vec_store_u(s0 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum20, sum30));
-    hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
-    hvx_vec_store_u(s1 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum21, sum31));
+    vec_store_f32_residual(s0, 2, hvx_vec_reduce_sum_f32x2(sum00, sum10), z0, tr);
+    vec_store_f32_residual(s0 + 2, 2, hvx_vec_reduce_sum_f32x2(sum20, sum30), z0 ? z0 + 2 : NULL, tr);
+    vec_store_f32_residual(s1, 2, hvx_vec_reduce_sum_f32x2(sum01, sum11), z1, tr);
+    vec_store_f32_residual(s1 + 2, 2, hvx_vec_reduce_sum_f32x2(sum21, sum31), z1 ? z1 + 2 : NULL, tr);
+}
+
+// Original signatures retain the unfused panel routes and arithmetic.
+static inline void vec_dot_f16_f32_panel_1x1(const uint32_t n, float * s,
+                                           const void * vx, const void * vy) {
+    vec_dot_f16_f32_panel_1x1_residual(n, s, vx, vy, NULL, NULL);
+}
+static inline void vec_dot_f16_f32_uu_2x2(const uint32_t n, float * s0, float * s1,
+                                        const void * vx0, const void * vx1, const void * vy0, const void * vy1) {
+    vec_dot_f16_f32_uu_2x2_residual(n, s0, s1, vx0, vx1, vy0, vy1, NULL, NULL, NULL);
+}
+static inline void vec_dot_f16_f32_uu_4x2(const uint32_t n, float * s0, float * s1,
+                                        const void * vx0, const void * vx1, const void * vx2, const void * vx3,
+                                        const void * vy0, const void * vy1) {
+    vec_dot_f16_f32_uu_4x2_residual(n, s0, s1, vx0, vx1, vx2, vx3, vy0, vy1, NULL, NULL, NULL);
+}
+
+// Packed weights retain the original 32-lane contribution order. Separate
+// multiply/add intrinsics and the same reduction preserve DDR panel arithmetic.
+static inline void vec_dot_f32_packed_f32_4x2(const uint32_t n, float * s0, float * s1,
+                                        const void * restrict vx0, const void * restrict vx1,
+                                        const void * restrict vx2, const void * restrict vx3,
+                                        const void * restrict vy0, const void * restrict vy1,
+                                        const float * z0, const float * z1, struct htp_thread_trace * tr) {
+    const uint8_t * x0 = vx0;
+    const uint8_t * x1 = vx1;
+    const uint8_t * x2 = vx2;
+    const uint8_t * x3 = vx3;
+    const uint8_t * y0 = vy0;
+    const uint8_t * y1 = vy1;
+    HVX_Vector sum00 = Q6_V_vzero(), sum01 = Q6_V_vzero();
+    HVX_Vector sum10 = Q6_V_vzero(), sum11 = Q6_V_vzero();
+    HVX_Vector sum20 = Q6_V_vzero(), sum21 = Q6_V_vzero();
+    HVX_Vector sum30 = Q6_V_vzero(), sum31 = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP32) {
+        const HVX_Vector w0 = *(const HVX_Vector *) (x0 + k * 4);
+        const HVX_Vector w1 = *(const HVX_Vector *) (x1 + k * 4);
+        const HVX_Vector w2 = *(const HVX_Vector *) (x2 + k * 4);
+        const HVX_Vector w3 = *(const HVX_Vector *) (x3 + k * 4);
+        HVX_Vector a0 = hvx_vmemu(y0 + k * 4);
+        HVX_Vector a1 = hvx_vmemu(y1 + k * 4);
+        sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(w0, a0));
+        sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(w0, a1));
+        sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(w1, a0));
+        sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(w1, a1));
+        sum20 = HVX_OP_ADD_F32(sum20, HVX_OP_MUL_F32(w2, a0));
+        sum21 = HVX_OP_ADD_F32(sum21, HVX_OP_MUL_F32(w2, a1));
+        sum30 = HVX_OP_ADD_F32(sum30, HVX_OP_MUL_F32(w3, a0));
+        sum31 = HVX_OP_ADD_F32(sum31, HVX_OP_MUL_F32(w3, a1));
+    }
+    vec_store_f32_residual(s0, 2, hvx_vec_reduce_sum_f32x2(sum00, sum10), z0, tr);
+    vec_store_f32_residual(s0 + 2, 2, hvx_vec_reduce_sum_f32x2(sum20, sum30), z0 ? z0 + 2 : NULL, tr);
+    vec_store_f32_residual(s1, 2, hvx_vec_reduce_sum_f32x2(sum01, sum11), z1, tr);
+    vec_store_f32_residual(s1 + 2, 2, hvx_vec_reduce_sum_f32x2(sum21, sum31), z1 ? z1 + 2 : NULL, tr);
+}
+
+static inline void vec_dot_f32_packed_f32_2x2(const uint32_t n, float * s0, float * s1,
+                                        const void * restrict vx0, const void * restrict vx1,
+                                        const void * restrict vy0, const void * restrict vy1,
+                                        const float * z0, const float * z1, struct htp_thread_trace * tr) {
+    const uint8_t * x0 = vx0;
+    const uint8_t * x1 = vx1;
+    const uint8_t * y0 = vy0;
+    const uint8_t * y1 = vy1;
+    HVX_Vector sum00 = Q6_V_vzero(), sum10 = Q6_V_vzero();
+    HVX_Vector sum01 = Q6_V_vzero(), sum11 = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP32) {
+        const HVX_Vector w0 = *(const HVX_Vector *) (x0 + k * 4);
+        const HVX_Vector w1 = *(const HVX_Vector *) (x1 + k * 4);
+        HVX_Vector a0 = hvx_vmemu(y0 + k * 4);
+        HVX_Vector a1 = hvx_vmemu(y1 + k * 4);
+        sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(w0, a0));
+        sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(w1, a0));
+        sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(w0, a1));
+        sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(w1, a1));
+
+    }
+    vec_store_f32_residual(s0, 2, hvx_vec_reduce_sum_f32x2(sum00, sum10), z0, tr);
+    vec_store_f32_residual(s1, 2, hvx_vec_reduce_sum_f32x2(sum01, sum11), z1, tr);
+}
+
+
+static inline void vec_dot_f32_packed_f32_1x1(const uint32_t n, float * s,
+                                             const void * restrict vx, const void * restrict vy,
+                                             const float * z, struct htp_thread_trace * tr) {
+    const HVX_Vector * x = vx;
+    const uint8_t * y = vy;
+    HVX_Vector sum = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP32) {
+        sum = HVX_OP_ADD_F32(sum, HVX_OP_MUL_F32(x[k / VLEN_FP32], hvx_vmemu(y + k * 4)));
+    }
+    vec_store_f32_residual(s, 1, hvx_vec_reduce_sum_f32(sum), z, tr);
 }
 
 #undef HVX_OP_ADD_F32

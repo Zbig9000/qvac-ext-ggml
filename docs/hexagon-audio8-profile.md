@@ -212,9 +212,9 @@ CPU/OpenCL timings and does not replace the separate panel-on/off experiment.
 
 ## F32 codec panels
 
-The Hexagon backend enables a 2x2 HVX DDR output panel by default for
-unbatched F16-weight/F32-activation matmuls. It widens the weights to F32 and
-reuses each weight and activation vector across two outputs. The existing
+The Hexagon backend enables a 4x2 HVX DDR output panel by default for
+unbatched F16-weight/F32-activation matmuls. Four output channels share each
+pair of activation rows, with weights widened to F32. The existing
 `vec_dot_f16_f32_uu_1x1` narrows activations to F16 internally, so this panel
 changes arithmetic as well as data reuse. F32 precision requested by a graph
 does not by itself prove that the old DDR helper retains F32 activations.
@@ -675,19 +675,19 @@ runs, and check per-stage cosine >=0.9999 plus generated tokens, EOS, frame
 count, and audio quality. Do not enable a routing change based only on these
 synthetic backend tests.
 
-## Codec panel prototype (QVAC-26763)
+## Default 4x2 codec panel (QVAC-26763)
 
 The follow-up [QVAC-26763](https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219313976732459)
-adds a selectable 4x2 HVX panel for the existing F16-weight/F32-activation DDR
+adds the default 4x2 HVX panel for the existing F16-weight/F32-activation DDR
 route. Four output channels share each pair of activation rows. Each output
 retains the 2x2 panel's F32 low-then-high accumulation order and pairwise
 reduction. VTCM selection, F32 precision guards and unsupported-shape fallbacks
-remain unchanged. The validated 2x2 panel remains the default until device
-correctness and performance gates pass; all previously validated optimizations
-remain enabled by default.
+remain unchanged. Device correctness and paired S1 performance evidence are
+recorded below. All previously validated optimizations remain enabled by default.
 
-For candidate testing, set `GGML_HEXAGON_F16_F32_PANEL_SHAPE=4x2`; use `2x2`
-or unset it for the default. Invalid values warn and select 2x2. The existing
+Unset `GGML_HEXAGON_F16_F32_PANEL_SHAPE` or set it to `4x2` for the default;
+set it to `2x2` to select the previous panel. Invalid values warn and select
+the default 4x2 panel. The existing
 `GGML_HEXAGON_F16_F32_PANEL=0` override still disables panel routing.
 With profiling enabled, selected 4x2 operations report `hvx-panel-4x2`.
 Capture that routing evidence separately from unprofiled timing runs.
@@ -726,8 +726,298 @@ The 4x2 worker is larger (850 instruction words and a 144-byte scalar frame,
 versus 517 words and 104 bytes for 2x2). This establishes build and static
 readiness, not a speedup.
 
-Device correctness, exact cross-panel agreement, CPU/OpenCL fixed-code gates,
-worker-count tuning and repeated S1–S5 timing are pending. The renewed QDC
-session exposed a different SM8750 device serial; it lost its upstream endpoint
-during model staging. Fresh baseline and candidate measurements on the same
-device are required before promotion or performance claims.
+Device validation subsequently completed on October 8 on the OnePlus 13s
+(CPH2723, SM8750/v79). All 29 oracle cases passed for both panel shapes with
+1, 2 and 6 HVX workers, with byte-identical results between panels. All 25
+fixed-code CPU/Hexagon/OpenCL codec boundary gates passed. Hexagon/OpenCL PCM
+cosine was 0.9999900834 and NMSE was 1.9834e-5 at 66 fixed frames.
+
+Paired S1 runs used the same build, models and device, greedy seed 42, four
+threads, all validated optimizations enabled, profiling off, three warmups and
+five timed runs per panel, alternating order, and thermal status 0 at every
+start:
+
+| Panel | Median inference (s) | Median codec synthesis (s) |
+| --- | ---: | ---: |
+| 2x2 | 14.5259 | 7.1467 |
+| 4x2 | 13.4106 | 5.8482 |
+
+The 4x2 panel reduced total time by 7.68% and codec time by 18.17%. All 16
+outputs had identical 66-frame codes and WAV hashes. These are existing S1
+measurements of explicitly selected panels, not a new run of the default
+change. The complete S1–S5 capture was subsequently recovered from the same
+phone and validated on October 12; see the table below. Performance tuning
+across worker counts is not included in these results.
+Evidence is recorded on QVAC-26763 and in
+`hexagon-26763-build/results/phone-s1-summary.json` and
+`hexagon-26763-build/results/phone-fixed-acceptance.json` beside the checkout.
+
+
+### Recovered October 8 S1–S5 comparison
+
+The phone retained the completed `phone-20261008-1434` suite even though the
+local handoff stopped at S1. All five prompt captures pass the existing strict
+artifact validator: three warmups and five timed runs per variant, profiling
+off, thermal status 0 before every run, finite stage timings, valid frame/code
+and WAV geometry, and byte-identical codes/WAVs across both panels and all
+repeats for each prompt. The manifest is the same as the saved S1 evidence.
+
+| Prompt | Frames | 2x2 median inference (s) | 4x2 median inference (s) | Less inference time |
+| --- | ---: | ---: | ---: | ---: |
+| S1 | 66 | 14.5259 | 13.4106 | 7.68% |
+| S2 | 55 | 11.8784 | 10.8054 | 9.03% |
+| S3 | 70 | 15.9245 | 14.6666 | 7.90% |
+| S4 | 70 | 17.1649 | 14.6040 | 14.92% |
+| S5 | 94 | 20.9144 | 19.9595 | 4.57% |
+
+The sum of per-prompt inference medians is 8.66% lower with 4x2. This is an
+aggregate of those five medians, not a new measured run or a universal gain.
+S4 reaches its frame cap. Some runs finish at thermal status 1, and several
+codec stage measurements have substantial variation; the S4/S5 codec medians
+are higher with 4x2. The consistently lower full-inference medians do not
+establish a uniform codec-stage improvement. The raw records and validation
+summary are retained in
+`hexagon-4x2-default-build/results/historical-suite/` and
+`hexagon-4x2-default-build/results/historical-suite-summary.json` beside the
+checkout.
+
+
+### Compiled-default correctness, October 12
+
+A fresh Hexagon host and DSP v79 build of runtime commit `74861e5e` was tested
+on the OnePlus 13s/SM8750. The same October CLI and shared CPU/OpenCL runtime
+were used for fixed-code comparisons; the OpenCL-enabled reference loader was
+recovered from the phone and its SHA-256 matches the historical manifest.
+The core/CPU/OpenCL sources have no diff between `5687b0e7` and `e282e85b`.
+Host, Android and DSP builds pass. All 29 host CPU-dequantized F32 oracle cases
+and the host operation-cache regression pass.
+
+On the device, all 29 oracle cases pass with 1, 2 and 6 HVX workers for each
+of explicit 2x2, explicit 4x2 and the shape setting unset. Every canonical
+result matches the same-build explicit 2x2 baseline byte for byte. The unset
+setting selects `hvx-panel-4x2` for eligible DDR cases in the separate routing
+capture. F32 arithmetic, VTCM precedence and excluded-layout fallbacks retain
+their existing behavior.
+
+All 25 fixed-code CPU/Hexagon/OpenCL boundary gates pass for 3 and 66 frames.
+The compiled default and explicit 2x2 produce byte-identical PCM at both
+lengths. Direct default Hexagon/OpenCL PCM cosine is 0.9999900834, NMSE
+1.9834e-5. The host buffer/CPU-copy/repack device regression also passes.
+
+Raw evidence and the independently validated fixed-code summary are retained
+in `hexagon-4x2-default-build/results/default4x2-20261012b/` and
+`hexagon-4x2-default-build/results/default-fixed-summary.json` beside the
+checkout. Runtime hashes and the shared-runtime provenance are in
+`hexagon-4x2-default-build/results/runtime-provenance-v3.json`.
+
+
+An invalid shape setting warns and uses 4x2; all 29 device oracle outputs with
+that setting and one worker match the compiled default exactly. A fresh greedy
+S1 synthesis with the shape setting unset produces the same 66-frame code/WAV
+SHA-256 values recorded above. The attempted new repeated S1 timing run was
+stopped before synthesis while waiting for thermal status 0: the service kept
+reporting status 1 with a cached `shell_skin` sample absent from current HAL
+readings. No thermal override was applied. The single synthesis is correctness
+evidence only; performance claims use the validated October 8 suite.
+
+## Codec weight reuse and F32 residual epilogues (QVAC-26841)
+
+The new routes are experimental and disabled by default; the compiled DDR
+panel remains 4x2. Each optimization can be measured independently.
+
+A fresh 4x2 PROFILE=1 S1 capture attributes 85.73% of leaf DSP cycles to
+MUL_MAT and 5.63% to ADD. The K96/output96, K192/output192 and
+K384/output384 codec families together account for 67.19%. A separate matrix
+reuse capture leaves ADD at approximately 6.20% of leaf cycles, supporting
+the residual epilogue experiment. These shares include operation execution
+setup and are not percentages of application wall time. They do not isolate
+weight conversion, cache misses or DDR bandwidth.
+
+| Control | Values | Default |
+| --- | --- | --- |
+| `GGML_HEXAGON_F16_F32_BLOCKED` | `0`, `1` | `0` |
+| `GGML_HEXAGON_F16_F32_BLOCKED_CHANNELS` | `8`, `16`, `32` | `16` |
+| `GGML_HEXAGON_F16_F32_BLOCKED_ROWS` | `32`, `64` | `32` |
+| `GGML_HEXAGON_F16_F32_BLOCKED_TRAVERSAL` | `channels`, `rows`, `matrix` | `channels` |
+| `GGML_HEXAGON_F16_F32_FUSE_ADD` | `0`, `1` | `0` |
+
+Blocked execution widens weights into per-worker, per-operation VTCM scratch
+and retains F32 activations. `channels` scans the assigned rows for each weight
+tile; `rows` repacks inside each activation block; `matrix` packs assigned
+weights once and visits bounded activation blocks. Matrix scratch at six
+workers is 216 KiB for K96/output96, 864 KiB for K192/output192 and 3,456 KiB
+for K384/output384. Budget failures retain the fallback. Existing efficient
+VTCM kernels retain precedence; no persistent weight cache is introduced.
+
+Fusion adds a full-size contiguous F32 residual after the completed matmul
+reduction and before the final store. It supports DDR4x2 without packing and
+the blocked routes. Broadcast bias and unsupported layouts retain separate
+ADD. Exact destination/residual reuse is safe; shifted overlaps and unsafe
+input/output aliases are rejected. Existing consumer, view and output guards
+protect observable matmul intermediates. A register barrier preserves the
+product's F32 boundary before ADD; assembly confirms SF32 plus SF32, no FMA,
+vector stack spills or reduction-loop helper calls. The production DDR4x2
+function's 850 instruction lines match immutable baseline after relocation
+addresses are normalized. A rounding fixture passes both earlier and final
+artifacts; no numerical failure-before claim is made.
+
+### Correctness and review
+
+Host, Android and DSP v79 builds pass on the OnePlus 13s/SM8750 setup. The
+expanded independent oracle has 48 cases, including protected outputs,
+additional consumers, layouts, aliases and exact rounding. Default,
+fusion-only and combined at 1/2/4/6 workers match immutable 4x2 byte for byte:
+576 case runs and 612 materialized result dumps. Earlier reuse checks cover
+all 24 tile/row/worker combinations for each traversal. Review fixed host
+selection of odd-byte row pitches; a 193-byte F16 pitch regression confirms
+DDR4x2 fallback. Device buffer/copy/repack and operation-cache tests pass.
+
+At fixed 3/66/94 frames, reuse-only, fusion-only and combined all pass CPU and
+OpenCL gates and produce identical baseline F32 PCM and PCM16 WAV bytes.
+Worst Hexagon/CPU cosine is 0.9999965358, NMSE 6.9298e-6; worst Hexagon/OpenCL
+cosine is 0.9999862050, NMSE 2.7591e-5. Repeated PCM is stable for these captures.
+These codec checks do not establish universal cross-backend generation
+equivalence. The separate 66-frame profile confirms 56 fused codec operations
+for both fusion-only and combined. Shape-derived traffic is logical bytes,
+not measured DDR bandwidth.
+
+Those 56 outputs total 609,878,016 F32 elements: 18 at 384x16896, one at
+768x16896, 19 at 192x67584 and 18 at 96x135168. Eliminating each intermediate
+write and subsequent read corresponds to 4,879,024,128 logical bytes per
+66-frame decode. Actual physical traffic depends on the cache hierarchy and
+was not measured with hardware counters.
+
+The existing model-backed harness passes at 3 frames. With cap 66 its CPU
+trajectory reaches EOS at 26 and reports seven language-model numeric
+threshold failures. Baseline and reuse have identical failure records, zero
+token/chain mismatches and passing codec stages. This pre-existing language
+model difference is outside the codec task; fixed-code tests supply actual
+66/94-frame checks.
+
+### Measurement status
+
+The initial channel traversal was slower in its completed 8-channel/32-row
+comparison. Matrix 16/64 synthetic medians are mixed and variable: K96 is
+28.41 ms baseline versus 37.46 ms candidate; K192 69.40 versus 35.96 ms;
+K384 48.63 versus 42.05 ms. These probes do not establish a codec or application
+improvement. The new routes remain opt-in.
+
+The full comparison uses 4x2, reuse-only, fusion-only and combined on S1-S5:
+greedy seed 42, four CPU threads, six HVX workers, three warmups plus five
+timed observations with rotating order. Profiling is off, OPSTAGE 3 computes
+the work, artifacts/models are pinned, thermal status 0 is required before
+timing, and codes/WAVs must match across variants and repeats. The complete
+suite and its strictly validated results are reported below.
+
+Evidence beside the checkout: `hexagon-26841-build/results/` (including
+`matrix-kernels-full-a/summary.json` and `fusion-fixed-final-b/summary.json`),
+`hexagon-26841-build/assembly/fusion/provenance.json`, and frozen `stage/`
+artifacts. Device raw results: `/data/local/tmp/qvac-26841/results/`.
+Task: https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219396967417382.
+
+### Four-variant end-to-end measurements, October 12
+
+OnePlus 13s / SM8750 / v79, six HVX workers and four CPU threads. Every
+variant has three fresh-process warmup captures and five timed captures for
+each prompt, in rotating order. Profiling is off and OPSTAGE=3. Thermal
+status 0 is required before each capture; post-run status may increase.
+All 160 captures have valid geometry, backend/worker/enable records and
+identical codes/WAV across variants and repetitions for their prompt.
+Runtime hashes match the pinned artifacts and were checked again after the
+end-to-end suite. S4 reaches its 70-frame cap.
+
+The table reports median inference / codec synthesis in seconds. Loading
+and output file I/O are excluded from inference.
+
+| Prompt | Frames | 4x2 baseline | Reuse only | Fusion only | Reuse + fusion |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S1 | 66 | 15.6055 / 3.1031 | 13.5930 / 4.0341 | 15.4613 / 5.6839 | 14.8563 / 3.5360 |
+| S2 | 55 | 11.1336 / 2.5306 | 14.1089 / 4.2445 | 13.5865 / 5.5199 | 12.5642 / 3.8144 |
+| S3 | 70 | 14.9305 / 6.0057 | 14.4205 / 4.4458 | 15.3639 / 4.6276 | 14.4814 / 5.4506 |
+| S4 | 70 | 15.2291 / 5.3148 | 13.9132 / 5.4535 | 15.5647 / 7.0429 | 14.2548 / 6.6874 |
+| S5 | 94 | 18.4920 / 8.0442 | 21.1038 / 7.2672 | 20.2864 / 4.4903 | 19.1223 / 5.0637 |
+
+Ranges and inference RTF below use the same five timed observations. These
+ranges are observed minima/maxima, not confidence intervals.
+
+| Prompt | Variant | Inference range (s) | Codec range (s) | Median inference RTF | Timed post-run thermal states |
+| --- | --- | ---: | ---: | ---: | --- |
+| S1 | 4x2 | 13.4016-18.3262 | 2.2108-5.8977 | 5.0915 | 0, 0, 0, 0, 0 |
+| S1 | reuse | 12.6501-16.1472 | 1.8394-5.2461 | 4.4349 | 0, 0, 0, 0, 0 |
+| S1 | fusion only | 12.0850-18.0866 | 2.9228-6.9973 | 5.0444 | 0, 0, 0, 0, 0 |
+| S1 | combined | 13.7264-18.9362 | 1.4555-6.6656 | 4.8470 | 0, 0, 0, 0, 0 |
+| S2 | 4x2 | 10.0010-12.7708 | 1.4987-4.7947 | 4.3589 | 0, 1, 0, 0, 0 |
+| S2 | reuse | 9.1255-14.5445 | 1.8386-4.5027 | 5.5238 | 0, 0, 0, 0, 0 |
+| S2 | fusion only | 9.7553-15.5507 | 2.3816-5.5899 | 5.3193 | 0, 0, 0, 0, 0 |
+| S2 | combined | 10.9137-15.0892 | 2.3013-5.2719 | 4.9190 | 0, 0, 0, 0, 0 |
+| S3 | 4x2 | 12.2650-19.0916 | 2.5246-6.0090 | 4.5929 | 0, 1, 0, 0, 0 |
+| S3 | reuse | 12.5263-17.4752 | 2.3011-5.4331 | 4.4360 | 1, 0, 0, 0, 1 |
+| S3 | fusion only | 11.7670-20.7434 | 2.4725-7.1152 | 4.7262 | 0, 0, 0, 0, 0 |
+| S3 | combined | 13.5180-14.6611 | 4.0129-6.7058 | 4.4547 | 0, 0, 0, 0, 0 |
+| S4 | 4x2 | 13.1606-15.8014 | 3.8945-6.0809 | 4.6847 | 0, 0, 0, 0, 0 |
+| S4 | reuse | 13.3911-17.3646 | 3.0742-5.7295 | 4.2799 | 1, 0, 0, 0, 0 |
+| S4 | fusion only | 12.4300-18.3670 | 3.1077-7.0569 | 4.7880 | 0, 0, 1, 0, 0 |
+| S4 | combined | 11.2475-18.0721 | 1.7781-7.0477 | 4.3850 | 0, 0, 0, 0, 0 |
+| S5 | 4x2 | 17.3044-23.4721 | 8.0005-8.0745 | 4.2361 | 1, 0, 0, 0, 1 |
+| S5 | reuse | 17.0552-24.1888 | 3.5401-7.3019 | 4.8344 | 0, 0, 1, 0, 0 |
+| S5 | fusion only | 19.0983-24.9814 | 4.2262-9.4213 | 4.6471 | 0, 0, 1, 0, 0 |
+| S5 | combined | 18.8636-25.7329 | 2.9809-9.0443 | 4.3805 | 0, 0, 0, 0, 0 |
+
+The sums of per-prompt medians are derived summaries, not a new measured
+run: baseline/reuse/fusion-only/combined inference is
+75.3907 / 77.1394 / 80.2628 / 75.2790 s; codec is
+24.9984 / 25.4451 / 27.3646 / 24.5521 s. Combined is only 0.15% lower in
+inference and 1.79% lower in codec by this summary. Reuse-only is 2.32%
+higher in inference and 1.79% higher in codec; fusion-only is 6.46% and 9.47%
+higher. Prompt-level regressions and wide spreads prevent a repeatable
+speedup claim. Retain the compiled 4x2 default and keep both prototypes
+opt-in.
+
+Decoder-only fixed-code timings below isolate codec execution from
+language-model timing variation.
+
+Strict raw records and validation: `hexagon-26841-build/results/suite-final-a/summary.json`.
+Runtime/source manifests: `hexagon-26841-build/final-provenance.json`.
+Model hashes are the same pinned files listed earlier in this guide.
+The CLI comes from speech source `30e04b00`; runtime source heads are
+`74861e5e` (baseline), `6c198659` (reuse only), and `ab3ee187` (fusion-only
+and combined). Matching host/DSP artifacts are retained under `stage/`.
+Independent review verifies manifest/variant/worker checks and rejects all
+18 deliberately invalid local fixtures.
+
+
+### Fixed-code decoder-only measurements, October 12
+
+All 64 captures pass strict backend/flag/hardware, timing, finite F32 PCM,
+RIFF format/geometry, thermal and pinned-runtime validation. Raw F32 PCM
+and WAV bytes match baseline across all variants and captures at each length.
+Each variant/length has three fresh-process warmup captures and five timed
+captures in rotating order. The full decoder call includes latent processing,
+graph setup, synthesis and PCM readback; the generation CLI reports latent and synthesis
+as separate stages. Model load, input validation and file I/O are excluded.
+
+| Frames | Variant | Median decoder (s) | Observed range (s) | Change vs 4x2 | Median decoder RTF | Timed post-run thermal states |
+| ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 66 | 4x2 | 4.055047 | 2.033156-5.906235 | +0.00% | 1.3230 | 0, 0, 0, 0, 0 |
+| 66 | reuse | 2.920937 | 2.011317-5.442260 | -27.97% | 0.9530 | 0, 0, 0, 0, 0 |
+| 66 | fusion only | 4.272690 | 2.689999-7.011464 | +5.37% | 1.3940 | 0, 1, 0, 0, 1 |
+| 66 | combined | 2.285171 | 2.043506-3.477122 | -43.65% | 0.7456 | 0, 0, 0, 0, 0 |
+| 94 | 4x2 | 6.086403 | 2.970825-8.318652 | +0.00% | 1.3943 | 0, 1, 0, 1, 0 |
+| 94 | reuse | 4.383213 | 3.902720-7.419366 | -27.98% | 1.0041 | 0, 0, 0, 0, 0 |
+| 94 | fusion only | 5.655863 | 2.862561-9.635843 | -7.07% | 1.2956 | 0, 0, 0, 0, 0 |
+| 94 | combined | 6.203125 | 2.899329-9.247434 | +1.92% | 1.4210 | 0, 0, 0, 0, 0 |
+
+Reuse medians are approximately 28% lower at both lengths, but observed
+ranges overlap and these five observations do not establish a repeatable
+application gain. Fusion-only is mixed; combined is 43.65% lower at 66
+frames and 1.92% higher at 94. The full-inference suite also has prompt-level
+regressions and substantial variation. Both prototypes remain opt-in; the
+compiled default is 4x2. Further tuning/default promotion requires stable
+matched measurements with no material suite regression.
+
+Strict raw records and validation: `hexagon-26841-build/results/codec-perf-final-a/summary.json`.
+Matching runners and validators are retained beside the checkout under
+`hexagon-26841-build/stage/`, `summarize-four-variants.py`,
+`summarize-codec-perf.py` and `suite-validation.py`; their hashes are recorded
+in `final-provenance.json`. Runtime artifacts were checked again after the
+decoder-only suite.

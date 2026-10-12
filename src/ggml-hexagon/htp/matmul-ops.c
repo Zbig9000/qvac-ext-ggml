@@ -346,7 +346,7 @@ static void hvx_mm_f16_f32_panel(unsigned int nth, unsigned int ith, void * data
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
 }
 
-// Experimental wider panel. Partition complete 4x2 tiles; the existing
+// Default DDR panel. Partition complete 4x2 tiles; the existing
 // 2x2/1x1 helpers cover only the final channel/activation remainders.
 static void hvx_mm_f16_f32_panel_4x2(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
@@ -393,6 +393,207 @@ static void hvx_mm_f16_f32_panel_4x2(unsigned int nth, unsigned int ith, void * 
         }
     }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+}
+
+// Residual variant keeps the production DDR worker unchanged.
+static void hvx_mm_f16_f32_panel_4x2_add(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+    const uint32_t mtiles = (ne01 + 3) / 4;
+    const uint32_t ntiles = (ne11 + 1) / 2;
+    const bool split_m = mtiles > ntiles;
+    const uint32_t tiles = split_m ? mtiles : ntiles;
+    const uint32_t per_thread = (tiles + nth - 1) / nth;
+    const uint32_t begin = MIN(ith * per_thread, tiles);
+    const uint32_t end = MIN(begin + per_thread, tiles);
+    if (begin == end) return;
+    const uint32_t m_begin = split_m ? 4 * begin : 0;
+    const uint32_t m_end = split_m ? MIN(4 * end, ne01) : ne01;
+    const uint32_t n_begin = split_m ? 0 : 2 * begin;
+    const uint32_t n_end = split_m ? ne11 : MIN(2 * end, ne11);
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+    for (uint32_t n = n_begin; n < n_end; n += 2) {
+        const uint8_t * a0 = (const uint8_t *) src1->data + n * nb11;
+        float * d0 = (float *) ((uint8_t *) dst->data + n * nb1);
+        const float * z0 = src2 ? (const float *) ((const uint8_t *) src2->data + (size_t) n * src2->nb[1]) : NULL;
+        if (n + 1 < n_end) {
+            const uint8_t * a1 = a0 + nb11;
+            float * d1 = (float *) ((uint8_t *) d0 + nb1);
+            const float * z1 = z0 ? z0 + src2->nb[1] / sizeof(float) : NULL;
+            uint32_t m = m_begin;
+            for (; m + 3 < m_end; m += 4) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_4x2_residual(ne00, d0 + m, d1 + m,
+                                      w0, w0 + nb01, w0 + 2 * nb01, w0 + 3 * nb01, a0, a1, z0 ? z0 + m : NULL, z1 ? z1 + m : NULL, tr);
+            }
+            for (; m + 1 < m_end; m += 2) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_2x2_residual(ne00, d0 + m, d1 + m, w0, w0 + nb01, a0, a1, z0 ? z0 + m : NULL, z1 ? z1 + m : NULL, tr);
+            }
+            if (m < m_end) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1_residual(ne00, d0 + m, w, a0, z0 ? z0 + m : NULL, tr);
+                vec_dot_f16_f32_panel_1x1_residual(ne00, d1 + m, w, a1, z1 ? z1 + m : NULL, tr);
+            }
+        } else {
+            for (uint32_t m = m_begin; m < m_end; ++m) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1_residual(ne00, d0 + m, w, a0, z0 ? z0 + m : NULL, tr);
+            }
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+}
+
+static inline void hvx_mm_f16_f32_pack_rows(const struct htp_tensor * src0, uint32_t ksize,
+                                           uint32_t first, uint32_t count, float * packed) {
+    for (uint32_t c = 0; c < count; ++c) {
+        const uint8_t * w = (const uint8_t *) src0->data + (size_t) (first + c) * src0->nb[1];
+        HVX_Vector * out = (HVX_Vector *) (packed + (size_t) c * ksize);
+        for (uint32_t k = 0; k < ksize; k += VLEN_FP16) {
+            const HVX_VectorPair wide = panel_f16_weights(w + k * 2, ksize - k);
+            out[k / VLEN_FP32] = Q6_V_lo_W(wide);
+            if (ksize - k >= VLEN_FP16) out[k / VLEN_FP32 + 1] = Q6_V_hi_W(wide);
+        }
+    }
+}
+
+// Each worker owns complete channel tiles or activation row pairs. Channels
+// traversal retains one tile across all rows. Rows traversal repacks each tile
+// per row block; matrix traversal packs once and bounds the active output rows.
+static void hvx_mm_f16_f32_blocked_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_ops_context * octx = data;
+    htp_matmul_tensors_preamble;
+    const struct htp_mm_kernel_params * p = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t tile = p->m_chunk;
+    const uint32_t mtiles = 1 + (ne01 - 1) / tile;
+    const uint32_t npairs = 1 + (ne11 - 1) / 2;
+    const bool split_m = mtiles > npairs;
+    const uint32_t work = split_m ? mtiles : npairs;
+    const uint32_t per_thread = (work + nth - 1) / nth;
+    const uint32_t first = MIN(ith * per_thread, work);
+    const uint32_t last = MIN(first + per_thread, work);
+    if (first == last) return;
+    const uint32_t mb = split_m ? first * tile : 0;
+    const uint32_t me = split_m ? MIN(last * tile, ne01) : ne01;
+    const uint32_t nb = split_m ? 0 : first * 2;
+    const uint32_t ne = split_m ? ne11 : MIN(last * 2, ne11);
+    const size_t worker_bytes = (size_t) p->vtcm_src0_size / nth;
+    float * packed = (float *) ((uint8_t *) octx->ctx->vtcm_base + ith * worker_bytes);
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    const bool row_outer = p->pipeline != HTP_MM_F16_F32_BLOCKED_CHANNELS;
+    const bool matrix = p->pipeline == HTP_MM_F16_F32_BLOCKED_MATRIX;
+    if (matrix) {
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, mb);
+        hvx_mm_f16_f32_pack_rows(src0, ne00, mb, me - mb, packed);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, mb);
+    }
+    const uint32_t outer_end = row_outer ? ne : me;
+    const uint32_t outer_step = row_outer ? p->n_chunk : tile;
+    for (uint32_t outer = row_outer ? nb : mb; outer < outer_end; outer += outer_step) {
+        const uint32_t mc_begin = row_outer ? mb : outer;
+        const uint32_t mc_end = row_outer ? me : MIN(outer + tile, me);
+        const uint32_t rb_begin = row_outer ? outer : nb;
+        const uint32_t rb_end = row_outer ? MIN(outer + p->n_chunk, ne) : ne;
+        for (uint32_t mc = mc_begin; mc < mc_end; mc += tile) {
+            const uint32_t count = MIN(tile, mc_end - mc);
+            const float * tile_weights = matrix ? packed + (size_t) (mc - mb) * ne00 : packed;
+            if (!matrix) {
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, mc);
+                hvx_mm_f16_f32_pack_rows(src0, ne00, mc, count, packed);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, mc);
+            }
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, mc);
+            for (uint32_t rb = rb_begin; rb < rb_end; rb += p->n_chunk) {
+                const uint32_t re = MIN(rb + p->n_chunk, rb_end);
+                for (uint32_t r = rb; r < re; r += 2) {
+                    const uint8_t * a0 = (const uint8_t *) src1->data + (size_t) r * nb11;
+                    float * d0 = (float *) ((uint8_t *) dst->data + (size_t) r * nb1) + mc;
+                    const float * z0 = src2 ? (const float *) ((const uint8_t *) src2->data + (size_t) r * src2->nb[1]) + mc : NULL;
+                    const float * z1 = z0 && r + 1 < re ? z0 + src2->nb[1] / sizeof(float) : NULL;
+                    uint32_t c = 0;
+                    if (r + 1 < re) {
+                        const uint8_t * a1 = a0 + nb11;
+                        float * d1 = (float *) ((uint8_t *) d0 + nb1);
+                        for (; c + 3 < count; c += 4) {
+                            const float * w = tile_weights + (size_t) c * ne00;
+                            vec_dot_f32_packed_f32_4x2(ne00, d0 + c, d1 + c,
+                                                      w, w + ne00, w + 2 * ne00, w + 3 * ne00, a0, a1, z0 ? z0 + c : NULL, z1 ? z1 + c : NULL, tr);
+                        }
+                        for (; c + 1 < count; c += 2) {
+                            const float * w = tile_weights + (size_t) c * ne00;
+                            vec_dot_f32_packed_f32_2x2(ne00, d0 + c, d1 + c, w, w + ne00, a0, a1, z0 ? z0 + c : NULL, z1 ? z1 + c : NULL, tr);
+                        }
+                        for (; c < count; ++c) {
+                            const float * w = tile_weights + (size_t) c * ne00;
+                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, w, a0, z0 ? z0 + c : NULL, tr);
+                            vec_dot_f32_packed_f32_1x1(ne00, d1 + c, w, a1, z1 ? z1 + c : NULL, tr);
+                        }
+                    } else {
+                        for (; c < count; ++c) {
+                            vec_dot_f32_packed_f32_1x1(ne00, d0 + c, tile_weights + (size_t) c * ne00, a0, z0 ? z0 + c : NULL, tr);
+                        }
+                    }
+                }
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, mc);
+        }
+    }
+}
+
+static bool hvx_mm_f16_f32_residual_layout(const struct htp_ops_context * octx, bool fused) {
+    htp_matmul_tensors_preamble;
+    if (src0->type != HTP_TYPE_F16 || src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
+        ne00 < 64 || ne00 % 32 || ne00 != ne10 || ne0 != ne01 || ne1 != ne11 || ne01 < 2 || ne11 < 2 ||
+        ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 || ne2 != 1 || ne3 != 1 || !octx->n_threads) return false;
+    if (fused != (src2 != NULL) ||
+        !htp_mm_f16_f32_rows_fit(ne00, ne01, 2, nb00, nb01, src0->size) ||
+        !htp_mm_f16_f32_rows_fit(ne10, ne11, 4, nb10, nb11, src1->size) ||
+        !htp_mm_f16_f32_rows_fit(ne0, ne1, 4, nb0, nb1, dst->size) ||
+        (src0->data & 1) || (src1->data & 3) || (dst->data & 3) ||
+        !htp_mm_f16_f32_disjoint(dst->data, dst->size, src0->data, src0->size) ||
+        !htp_mm_f16_f32_disjoint(dst->data, dst->size, src1->data, src1->size)) return false;
+    if (src2) {
+        if (src2->type != HTP_TYPE_F32 || (src2->data & 3) ||
+            ne20 != ne0 || ne21 != ne1 || ne22 != 1 || ne23 != 1 ||
+            src2->nb[1] != (size_t) ne0 * 4 || nb1 != (size_t) ne0 * 4 ||
+            !htp_mm_f16_f32_rows_fit(ne20, ne21, 4, src2->nb[0], src2->nb[1], src2->size) ||
+            !htp_mm_f16_f32_disjoint(src2->data, src2->size, src0->data, src0->size) ||
+            !htp_mm_f16_f32_disjoint(src2->data, src2->size, src1->data, src1->size) ||
+            !htp_mm_f16_f32_residual_alias_ok(dst->data, dst->size, src2->data, src2->size)) return false;
+    }
+    return true;
+}
+
+static int hvx_mm_f16_f32_ddr_add(struct htp_ops_context * octx) {
+    const struct htp_mm_kernel_params * p = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    if (!hvx_mm_f16_f32_residual_layout(octx, true) || p->tile_size != HTP_MM_F16_F32_PANEL_4X2 ||
+        p->n_hmx || p->vtcm_size || p->vtcm_src0_size || p->vtcm_src1_size || p->vtcm_dst_size) return HTP_STATUS_NO_SUPPORT;
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) return HTP_STATUS_OK;
+    struct htp_mm_context mmctx = { .octx = octx };
+    worker_pool_run_func(octx->ctx->worker_pool, hvx_mm_f16_f32_panel_4x2_add, &mmctx, octx->n_threads);
+    return HTP_STATUS_OK;
+}
+
+static int hvx_mm_f16_f32_blocked(struct htp_ops_context * octx) {
+    htp_matmul_tensors_preamble;
+    const struct htp_mm_kernel_params * p = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    size_t worker_bytes = 0, total = 0;
+    const bool fused = p->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD;
+    if (!hvx_mm_f16_f32_residual_layout(octx, fused)) return HTP_STATUS_NO_SUPPORT;
+    // Recheck the tagged route at the DSP boundary before aligned VTCM writes.
+    if (src0->type != HTP_TYPE_F16 || src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
+        ne00 != ne10 || ne0 != ne01 || ne1 != ne11 || ne11 < 2 || ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 || ne2 != 1 || ne3 != 1 ||
+        nb00 != 2 || nb10 != 4 || nb0 != 4 ||
+        (size_t) nb01 < (size_t) ne00 * 2 || (size_t) nb11 < (size_t) ne10 * 4 || (size_t) nb1 < (size_t) ne01 * 4 ||
+        (p->n_chunk != 32 && p->n_chunk != 64) ||
+        !htp_mm_f16_f32_blocked_scratch_for_traversal(ne00, ne01, p->m_chunk, octx->n_threads, p->pipeline, &worker_bytes, &total) ||
+        p->vtcm_size != (int32_t) total || p->vtcm_src0_size != (int32_t) total) return HTP_STATUS_NO_SUPPORT;
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) return HTP_STATUS_OK;
+    if (octx->ctx->vtcm_size < total || !octx->ctx->vtcm_base ||
+        ((uintptr_t) octx->ctx->vtcm_base & (VLEN - 1))) return HTP_STATUS_VTCM_TOO_SMALL;
+    worker_pool_run_func(octx->ctx->worker_pool, hvx_mm_f16_f32_blocked_thread, octx, octx->n_threads);
+    return HTP_STATUS_OK;
 }
 
 // Specialized repacked matmul macros
@@ -3772,6 +3973,15 @@ static void hvx_mm_k9_thread(unsigned int nth, unsigned int ith, void * data) {
 
 int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_DDR_ADD) {
+        return hvx_mm_f16_f32_ddr_add(octx);
+    }
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED ||
+        kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD) {
+        return hvx_mm_f16_f32_blocked(octx);
+    }
 
     if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F16_K9) {
         if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) || octx->n_threads == 0) {

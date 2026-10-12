@@ -355,6 +355,19 @@ struct htp_opformat {
             const auto * kparams = (const struct htp_mm_kernel_params *) node.kernel_params;
             const char * path = "unknown";
             int32_t type = kparams->kernel_type;
+            if (type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED || type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD) {
+                snprintf(str, max_size, "%s channels %d rows %d traversal %s vtcm %d",
+                         type == HTP_MM_KERNEL_HVX_F16_F32_BLOCKED_ADD ? "hvx-blocked-f32-add" : "hvx-blocked-f32",
+                         kparams->m_chunk, kparams->n_chunk,
+                         kparams->pipeline == HTP_MM_F16_F32_BLOCKED_CHANNELS ? "channels" :
+                         kparams->pipeline == HTP_MM_F16_F32_BLOCKED_ROWS ? "rows" : "matrix",
+                         kparams->vtcm_size);
+                return;
+            }
+            if (type == HTP_MM_KERNEL_HVX_F16_F32_DDR_ADD) {
+                snprintf(str, max_size, "hvx-panel-4x2-add vtcm %d", kparams->vtcm_size);
+                return;
+            }
             if (type == HTP_MM_KERNEL_HMX_2D || type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
                 path = "hmx-tiled";
             } else if (type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
