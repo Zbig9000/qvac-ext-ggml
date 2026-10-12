@@ -819,3 +819,85 @@ stopped before synthesis while waiting for thermal status 0: the service kept
 reporting status 1 with a cached `shell_skin` sample absent from current HAL
 readings. No thermal override was applied. The single synthesis is correctness
 evidence only; performance claims use the validated October 8 suite.
+
+## Codec weight reuse and F32 residual epilogues (QVAC-26841)
+
+The new routes are experimental and disabled by default; the compiled DDR
+panel remains 4x2. Each optimization can be measured independently.
+
+| Control | Values | Default |
+| --- | --- | --- |
+| `GGML_HEXAGON_F16_F32_BLOCKED` | `0`, `1` | `0` |
+| `GGML_HEXAGON_F16_F32_BLOCKED_CHANNELS` | `8`, `16`, `32` | `16` |
+| `GGML_HEXAGON_F16_F32_BLOCKED_ROWS` | `32`, `64` | `32` |
+| `GGML_HEXAGON_F16_F32_BLOCKED_TRAVERSAL` | `channels`, `rows`, `matrix` | `channels` |
+| `GGML_HEXAGON_F16_F32_FUSE_ADD` | `0`, `1` | `0` |
+
+Blocked execution widens weights into per-worker, per-operation VTCM scratch
+and retains F32 activations. `channels` scans the assigned rows for each weight
+tile; `rows` repacks inside each activation block; `matrix` packs assigned
+weights once and visits bounded activation blocks. Matrix scratch at six
+workers is 216 KiB for K96/output96, 864 KiB for K192/output192 and 3,456 KiB
+for K384/output384. Budget failures retain the fallback. Existing efficient
+VTCM kernels retain precedence; no persistent weight cache is introduced.
+
+Fusion adds a full-size contiguous F32 residual after the completed matmul
+reduction and before the final store. It supports DDR4x2 without packing and
+the blocked routes. Broadcast bias and unsupported layouts retain separate
+ADD. Exact destination/residual reuse is safe; shifted overlaps and unsafe
+input/output aliases are rejected. Existing consumer, view and output guards
+protect observable matmul intermediates. A register barrier preserves the
+product's F32 boundary before ADD; assembly confirms SF32 plus SF32, no FMA,
+vector stack spills or reduction-loop helper calls. The production DDR4x2
+function's 850 instruction lines match immutable baseline after relocation
+addresses are normalized. A rounding fixture passes both earlier and final
+artifacts; no numerical failure-before claim is made.
+
+### Correctness and review
+
+Host, Android and DSP v79 builds pass on the OnePlus 13s/SM8750 setup. The
+expanded independent oracle has 48 cases, including protected outputs,
+additional consumers, layouts, aliases and exact rounding. Default,
+fusion-only and combined at 1/2/4/6 workers match immutable 4x2 byte for byte:
+576 case runs and 612 materialized result dumps. Earlier reuse checks cover
+all 24 tile/row/worker combinations for each traversal. Review fixed host
+selection of odd-byte row pitches; a 193-byte F16 pitch regression confirms
+DDR4x2 fallback. Device buffer/copy/repack and operation-cache tests pass.
+
+At fixed 3/66/94 frames, reuse-only, fusion-only and combined all pass CPU and
+OpenCL gates and produce identical baseline F32 PCM and PCM16 WAV bytes.
+Worst Hexagon/CPU cosine is 0.9999965358, NMSE 6.9298e-6; worst Hexagon/OpenCL
+cosine is 0.9999862050, NMSE 2.7591e-5. Repeated PCM is stable for these captures.
+These codec checks do not establish universal cross-backend generation
+equivalence. The separate 66-frame profile confirms 56 fused codec operations
+for both fusion-only and combined. Shape-derived traffic is logical bytes,
+not measured DDR bandwidth.
+
+The existing model-backed harness passes at 3 frames. With cap 66 its CPU
+trajectory reaches EOS at 26 and reports seven language-model numeric
+threshold failures. Baseline and reuse have identical failure records, zero
+token/chain mismatches and passing codec stages. This pre-existing language
+model difference is outside the codec task; fixed-code tests supply actual
+66/94-frame checks.
+
+### Measurement status
+
+The initial channel traversal was slower in its completed 8-channel/32-row
+comparison. Matrix 16/64 synthetic medians are mixed and variable: K96 is
+28.41 ms baseline versus 37.46 ms candidate; K192 69.40 versus 35.96 ms;
+K384 48.63 versus 42.05 ms. These probes do not establish a codec or application
+improvement. The new routes remain opt-in.
+
+The full comparison uses 4x2, reuse-only, fusion-only and combined on S1-S5:
+greedy seed 42, four CPU threads, six HVX workers, three warmups plus five
+timed observations with rotating order. Profiling is off, OPSTAGE 3 computes
+the work, artifacts/models are pinned, thermal status 0 is required before
+timing, and codes/WAVs must match across variants and repeats. This final
+suite is running on the reconnected OnePlus. No full-suite gain is claimed
+until all measurements and artifact checks are complete.
+
+Evidence beside the checkout: `hexagon-26841-build/results/` (including
+`matrix-kernels-full-a/summary.json` and `fusion-fixed-final-b/summary.json`),
+`hexagon-26841-build/assembly/fusion/provenance.json`, and frozen `stage/`
+artifacts. Device raw results: `/data/local/tmp/qvac-26841/results/`.
+Task: https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219396967417382.
