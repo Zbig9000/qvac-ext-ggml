@@ -395,11 +395,123 @@ static void fa_f32_thread(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
+// One query per head: vectorize over head dimensions rather than padding the
+// query axis to 128. Scores and probabilities stay in per-worker VTCM; the
+// value rows are read directly from the position-major cache. Online softmax
+// retains F32 state across key tiles, so context length is not capped at 128.
+struct fa_f32_decode_context {
+    struct htp_ops_context * octx;
+    struct hvx_fa_f32_vtcm_layout layout;
+    const struct htp_fa_kernel_params * params;
+    uint32_t items_per_thread;
+    uint32_t n_items;
+};
+
+static inline float fa_f32_decode_lane0(HVX_Vector vector) {
+    float lanes[VLEN_FP32] __attribute__((aligned(VLEN)));
+    *(HVX_Vector *) lanes = vector;
+    return lanes[0];
+}
+
+static void fa_f32_decode_thread(unsigned int nth, unsigned int ith, void * data) {
+    const struct fa_f32_decode_context * c = data;
+    const struct htp_tensor * q = c->octx->src[0];
+    const struct htp_tensor * k = c->octx->src[1];
+    const struct htp_tensor * v = c->octx->src[2];
+    const struct htp_tensor * dst = c->octx->dst;
+    uint8_t * base = c->octx->ctx->vtcm_base + ith * c->layout.bytes_per_thread;
+    float * query = (float *) (base + c->layout.off_qrows);
+    float * scores = (float *) (base + c->layout.off_s);
+    HVX_Vector * output = (HVX_Vector *) (base + c->layout.off_ot);
+    const uint32_t begin = ith * c->items_per_thread;
+    const uint32_t end = MIN(begin + c->items_per_thread, c->n_items);
+    for (uint32_t item = begin; item < end; ++item) {
+        const uint32_t h = item % q->ne[2];
+        const uint32_t b = item / q->ne[2];
+        const uint32_t hk = fastdiv(h, &c->params->broadcast_rk2);
+        const uint32_t bk = fastdiv(b, &c->params->broadcast_rk3);
+        const uint32_t hv = fastdiv(h, &c->params->broadcast_rv2);
+        const uint32_t bv = fastdiv(b, &c->params->broadcast_rv3);
+        memcpy(query, fa_f32_row(q, 0, h, b), q->ne[0] * sizeof(float));
+        for (uint32_t d = 0; d < v->ne[0] / VLEN_FP32; ++d) output[d] = Q6_V_vzero();
+        float maximum = -FLT_MAX;
+        float denominator = 0.0f;
+        for (uint32_t key0 = 0; key0 < k->ne[1]; key0 += HTP_FA_F32_KEY_TILE) {
+            const uint32_t nk = MIN(HTP_FA_F32_KEY_TILE, k->ne[1] - key0);
+            float next_max = maximum;
+            fa_f32_prefetch_rows(k, key0, nk, hk, bk, q->ne[0] * sizeof(float));
+            for (uint32_t j = 0; j < nk; ++j) {
+                const float * kr = fa_f32_row(k, key0 + j, hk, bk);
+                HVX_Vector sum = Q6_V_vzero();
+                for (uint32_t d = 0; d < q->ne[0]; d += VLEN_FP32) {
+                    sum = fa_f32_madd(sum, *(const HVX_Vector *) (query + d),
+                                     *(const HVX_UVector *) (kr + d));
+                }
+                scores[j] = fa_f32_decode_lane0(hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sum))) * c->params->scale;
+                next_max = fmaxf(next_max, scores[j]);
+            }
+            const float alpha = denominator > 0.0f ? expf(maximum - next_max) : 0.0f;
+            const uint32_t padded = hex_align_up(nk, VLEN_FP32);
+            for (uint32_t j = nk; j < padded; ++j) scores[j] = -INFINITY;
+            HVX_Vector psum = Q6_V_vzero();
+            for (uint32_t j = 0; j < padded; j += VLEN_FP32) {
+                HVX_Vector s = *(HVX_Vector *) (scores + j);
+                HVX_Vector p = hvx_vec_exp_f32(Q6_Vsf_equals_Vqf32(
+                    Q6_Vqf32_vsub_VsfVsf(s, hvx_vec_splat_f32(next_max))));
+                // Invalid tail lanes and masked -infinity values must be zero.
+                const HVX_VectorPred valid = Q6_Q_vcmp_gt_VsfVsf(s, hvx_vec_splat_f32(-INFINITY));
+                p = Q6_V_vmux_QVV(valid, p, Q6_V_vzero());
+                *(HVX_Vector *) (scores + j) = p;
+                psum = Q6_Vqf32_vadd_Vqf32Vsf(psum, p);
+            }
+            denominator = denominator * alpha + fa_f32_decode_lane0(
+                hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(psum)));
+            fa_f32_prefetch_rows(v, key0, nk, hv, bv, v->ne[0] * sizeof(float));
+            for (uint32_t d = 0; d < v->ne[0]; d += VLEN_FP32) {
+                HVX_Vector acc = Q6_Vqf32_vmpy_VsfVsf(output[d / VLEN_FP32], hvx_vec_splat_f32(alpha));
+                for (uint32_t j = 0; j < nk; ++j) {
+                    acc = fa_f32_madd(acc, *(const HVX_UVector *) (fa_f32_row(v, key0 + j, hv, bv) + d),
+                                      hvx_vec_splat_f32(scores[j]));
+                }
+                output[d / VLEN_FP32] = Q6_Vsf_equals_Vqf32(acc);
+            }
+            maximum = next_max;
+        }
+        const HVX_Vector inverse = hvx_vec_splat_f32(1.0f / denominator);
+        float * out = (float *) ((uint8_t *) dst->data + h * dst->nb[1] + b * dst->nb[3]);
+        for (uint32_t d = 0; d < v->ne[0]; d += VLEN_FP32) {
+            *(HVX_UVector *) (out + d) = Q6_Vsf_equals_Vqf32(
+                Q6_Vqf32_vmpy_VsfVsf(output[d / VLEN_FP32], inverse));
+        }
+    }
+}
+
+static int fa_f32_decode(struct htp_ops_context * octx) {
+    const struct htp_tensor * q = octx->src[0];
+    const struct htp_tensor * k = octx->src[1];
+    const struct htp_tensor * v = octx->src[2];
+    struct fa_f32_decode_context c = {.octx = octx, .params = (const struct htp_fa_kernel_params *) octx->kernel_params};
+    if (q->ne[1] != 1 || k->ne[1] == 0 || octx->src[3] || octx->src[4] ||
+        q->type != HTP_TYPE_F32 || k->type != HTP_TYPE_F32 || v->type != HTP_TYPE_F32 ||
+        octx->dst->type != HTP_TYPE_F32 || q->ne[0] % VLEN_FP32 || v->ne[0] % VLEN_FP32 ||
+        q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float)) return HTP_STATUS_NO_SUPPORT;
+    hvx_fa_f32_decode_vtcm_layout_build(&c.layout, q->ne[0], v->ne[0], octx->n_threads);
+    if (c.layout.total_bytes > octx->ctx->vtcm_size) return HTP_STATUS_VTCM_TOO_SMALL;
+    c.n_items = q->ne[2] * q->ne[3];
+    const uint32_t threads = MIN(octx->n_threads, c.n_items);
+    if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) || threads == 0) return HTP_STATUS_OK;
+    c.items_per_thread = (c.n_items + threads - 1) / threads;
+    worker_pool_run_func(octx->ctx->worker_pool, fa_f32_decode_thread, &c, threads);
+    return HTP_STATUS_OK;
+}
+
 int op_flash_attn_ext_f32(struct htp_ops_context * octx) {
     const struct htp_tensor *           q       = octx->src[0];
     const struct htp_tensor *           k       = octx->src[1];
     const struct htp_tensor *           v       = octx->src[2];
     const struct htp_fa_kernel_params * kparams = (const struct htp_fa_kernel_params *) octx->kernel_params;
+
+    if (kparams->kernel_type == HTP_FA_KERNEL_HVX_F32_DECODE) return fa_f32_decode(octx);
 
     if (q->type != HTP_TYPE_F32 || k->type != HTP_TYPE_F32 || v->type != HTP_TYPE_F32 ||
         octx->dst->type != HTP_TYPE_F32 || kparams->Br != FA_F32_R * VLEN_FP32 || q->ne[0] % VLEN_FP32 != 0 ||

@@ -30,7 +30,8 @@ enum htp_fa_kernel_type {
     HTP_FA_KERNEL_UNSUPPORTED = 0,
     HTP_FA_KERNEL_HVX,
     HTP_FA_KERNEL_HMX,
-    HTP_FA_KERNEL_HVX_F32
+    HTP_FA_KERNEL_HVX_F32,
+    HTP_FA_KERNEL_HVX_F32_DECODE
 };
 
 #define HTP_FA_F32_LANES      32
@@ -48,6 +49,16 @@ struct hvx_fa_f32_vtcm_layout {
     size_t bytes_per_thread;
     size_t total_bytes;
 };
+
+static inline void hvx_fa_f32_decode_vtcm_layout_build(struct hvx_fa_f32_vtcm_layout * L,
+                                                      size_t DK, size_t DV, size_t n_threads) {
+    size_t off = 0;
+    VTCM_LAYOUT_ALLOC(off, off_qrows, hex_align_up(DK * sizeof(float), 128));
+    VTCM_LAYOUT_ALLOC(off, off_s, HTP_FA_F32_KEY_TILE * sizeof(float));
+    VTCM_LAYOUT_ALLOC(off, off_ot, hex_align_up(DV * sizeof(float), 128));
+    L->bytes_per_thread = off;
+    L->total_bytes = off * n_threads;
+}
 
 static inline void hvx_fa_f32_vtcm_layout_build(struct hvx_fa_f32_vtcm_layout * L, size_t DK, size_t DV,
                                                 size_t Bq, size_t Bk, size_t n_threads) {

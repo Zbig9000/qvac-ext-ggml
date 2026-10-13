@@ -7,6 +7,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <float.h>
 
 #include "hex-dma.h"
 #include "hvx-utils.h"
@@ -213,6 +214,55 @@ static float hvx_softmax_f32(const uint8_t * restrict src, uint8_t * restrict ds
     return hvx_reduce_sum_f32(dst, num_elems);
 }
 
+// Audio decode and short prefill rows rarely fill a vector. Copy only their
+// valid bytes into aligned VTCM, then keep scale, mask, max, exp, sum and
+// normalization vectorized. Explicit -infinity padding prevents tail lanes
+// from contributing to either reduction or being written beyond the row.
+static void hvx_short_softmax_f32(const float * src, float * dst, const float * mask,
+                                 float * work, float * probabilities, uint32_t count,
+                                 float scale, float slope) {
+    const uint32_t padded = hex_align_up(count, VLEN_FP32);
+    memcpy(work, src, count * sizeof(float));
+    for (uint32_t i = count; i < padded; ++i) work[i] = 0.0f;
+    if (mask) {
+        memcpy(probabilities, mask, count * sizeof(float));
+        for (uint32_t i = count; i < padded; ++i) probabilities[i] = 0.0f;
+    }
+    HVX_Vector maximum = hvx_vec_splat_f32(-FLT_MAX);
+    const HVX_Vector scale_vec = hvx_vec_splat_f32(scale);
+    const HVX_Vector slope_vec = hvx_vec_splat_f32(slope);
+    for (uint32_t i = 0; i < padded; i += VLEN_FP32) {
+        HVX_Vector scaled = Q6_Vqf32_vmpy_VsfVsf(*(HVX_Vector *) (work + i), scale_vec);
+        if (mask) {
+            scaled = Q6_Vqf32_vadd_Vqf32Vqf32(scaled,
+                Q6_Vqf32_vmpy_VsfVsf(*(HVX_Vector *) (probabilities + i), slope_vec));
+        }
+        *(HVX_Vector *) (work + i) = Q6_Vsf_equals_Vqf32(scaled);
+    }
+    for (uint32_t i = count; i < padded; ++i) work[i] = -INFINITY;
+    for (uint32_t i = 0; i < padded; i += VLEN_FP32) {
+        maximum = Q6_Vsf_vmax_VsfVsf(maximum, *(HVX_Vector *) (work + i));
+    }
+    maximum = hvx_vec_reduce_max_f32(maximum);
+    HVX_Vector sum = Q6_V_vzero();
+    for (uint32_t i = 0; i < padded; i += VLEN_FP32) {
+        const HVX_Vector value = *(HVX_Vector *) (work + i);
+        HVX_Vector p = hvx_vec_exp_f32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(value, maximum)));
+        const HVX_VectorPred finite = Q6_Q_vcmp_gt_VsfVsf(value, hvx_vec_splat_f32(-INFINITY));
+        p = Q6_V_vmux_QVV(finite, p, Q6_V_vzero());
+        *(HVX_Vector *) (probabilities + i) = p;
+        sum = Q6_Vqf32_vadd_Vqf32Vsf(sum, p);
+    }
+    float lanes[VLEN_FP32] __attribute__((aligned(VLEN)));
+    *(HVX_Vector *) lanes = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sum));
+    const HVX_Vector inverse = hvx_vec_splat_f32(lanes[0] > 0.0f ? 1.0f / lanes[0] : 1.0f);
+    for (uint32_t i = 0; i < padded; i += VLEN_FP32) {
+        *(HVX_Vector *) (work + i) = Q6_Vsf_equals_Vqf32(
+            Q6_Vqf32_vmpy_VsfVsf(*(HVX_Vector *) (probabilities + i), inverse));
+    }
+    memcpy(dst, work, count * sizeof(float));
+}
+
 static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
     struct htp_softmax_context * smctx = (struct htp_softmax_context *) data;
     struct htp_ops_context * octx = smctx->octx;
@@ -304,7 +354,9 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
         __fp16 * mp_f16 = (smctx->use_src1) ? (__fp16 *) ((char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13) : NULL;
         float *  mp_f32 = (smctx->use_src1) ? (float *)  ((char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13) : NULL;
 
-        if ((1 == opt_path) && (mp_f32) && !(smctx->use_f16)) {
+        if (!opt_path && ne00 <= 128 && !smctx->use_f16) {
+            hvx_short_softmax_f32(sp, dp, mp_f32, wp0, wp1, ne00, smctx->scale, slope);
+        } else if ((1 == opt_path) && (mp_f32) && !(smctx->use_f16)) {
             hvx_fast_softmax_prep_f32((const uint8_t *) sp, (uint8_t *) wp0, ne00, smctx->scale, (const uint8_t *) mp_f32, slope);
             hvx_fast_softmax_f32((const uint8_t *) wp0, (uint8_t *) dp, (uint8_t *) wp1, ne00);
         } else if (1 == opt_path) {

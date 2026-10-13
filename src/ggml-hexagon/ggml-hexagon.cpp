@@ -2243,7 +2243,13 @@ static void ggml_hexagon_precompute_flash_attn_f32_params(const struct ggml_hexa
     kparams->n_threads   = sess->n_threads;
 
     struct hvx_fa_f32_vtcm_layout L;
-    hvx_fa_f32_vtcm_layout_build(&L, q->ne[0], v->ne[0], kparams->Br, kparams->Bc, sess->n_threads);
+    if (q->ne[1] == 1) {
+        kparams->kernel_type = HTP_FA_KERNEL_HVX_F32_DECODE;
+        kparams->Br = 1;
+        hvx_fa_f32_decode_vtcm_layout_build(&L, q->ne[0], v->ne[0], sess->n_threads);
+    } else {
+        hvx_fa_f32_vtcm_layout_build(&L, q->ne[0], v->ne[0], kparams->Br, kparams->Bc, sess->n_threads);
+    }
     kparams->vtcm_size = L.total_bytes;
 
     kparams->broadcast_rk2 = init_fastdiv_values(q->ne[2] / k->ne[2]);

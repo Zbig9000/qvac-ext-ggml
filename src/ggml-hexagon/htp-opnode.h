@@ -394,6 +394,10 @@ struct htp_opformat {
                 path = kparams->u.hmx.pipeline ? "hmx-pipe" : "hmx-seq";
             } else if (type == HTP_FA_KERNEL_HVX) {
                 path = "hvx";
+            } else if (type == HTP_FA_KERNEL_HVX_F32) {
+                path = "hvx-f32";
+            } else if (type == HTP_FA_KERNEL_HVX_F32_DECODE) {
+                path = "hvx-f32-decode";
             }
             snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
         } else if (htp_op_is_unary(node.opcode)) {
