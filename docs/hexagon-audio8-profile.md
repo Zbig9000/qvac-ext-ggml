@@ -1,11 +1,11 @@
 # Audio8 matmul profiling and correctness
 
-QVAC-26715 originally proposed routing Audio8's large fused `MUL_MAT+ADD` to
+The initial investigation proposed routing Audio8's large fused `MUL_MAT+ADD` to
 HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
 request F32 precision and stay on HVX**. Historical HMX dispatch does not
 establish the route taken by the current application.
 
-## Dispatch investigation (QVAC-26714)
+## Dispatch investigation
 
 The task's historical "58% framework overhead" estimate treated inclusive
 OPBATCH timing as exclusive dispatch time. It is not a valid overhead estimate.
@@ -378,7 +378,7 @@ from about 3.4 s to 7.3 s. These mixed-state, incomplete results are not the
 final cross-backend benchmark. The user retained S1 and subsequently
 cancelled the S2–S5 continuation on replacement device `e8b7f0c8`. The partial
 sweep is preserved as diagnostics; it does not replace the validated same-device
-S1 panel comparison above. Under QVAC-26714, the user subsequently requested
+S1 panel comparison above. The user subsequently requested
 a new Hexagon-only S1–S5 sweep with all validated defaults enabled; it is a
 separate candidate experiment, not a continuation of that three-backend sweep.
 
@@ -675,10 +675,10 @@ runs, and check per-stage cosine >=0.9999 plus generated tokens, EOS, frame
 count, and audio quality. Do not enable a routing change based only on these
 synthetic backend tests.
 
-## Default 4x2 codec panel (QVAC-26763)
+## Default 4x2 codec panel
 
-The follow-up [QVAC-26763](https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219313976732459)
-adds the default 4x2 HVX panel for the existing F16-weight/F32-activation DDR
+The follow-up work adds the default 4x2 HVX panel for the existing
+F16-weight/F32-activation DDR
 route. Four output channels share each pair of activation rows. Each output
 retains the 2x2 panel's F32 low-then-high accumulation order and pairwise
 reduction. VTCM selection, F32 precision guards and unsupported-shape fallbacks
@@ -710,7 +710,7 @@ GGML_HEXAGON_NHVX=6 GGML_HEXAGON_F16_F32_PANEL_SHAPE=4x2 \
 `--reference-only`. Host-only reference checks do not validate DSP execution.
 
 `test-backend-ops` also includes the three dominant shapes from the complete
-QVAC-26714 S1 trace: K96/output96/rows135168,
+complete S1 trace: K96/output96/rows135168,
 K192/output192/rows67584 and K384/output384/rows16896. Select only those cases
 for an unprofiled comparison, with the chosen panel shape set in the environment:
 
@@ -748,9 +748,8 @@ measurements of explicitly selected panels, not a new run of the default
 change. The complete S1–S5 capture was subsequently recovered from the same
 phone and validated on October 12; see the table below. Performance tuning
 across worker counts is not included in these results.
-Evidence is recorded on QVAC-26763 and in
-`hexagon-26763-build/results/phone-s1-summary.json` and
-`hexagon-26763-build/results/phone-fixed-acceptance.json` beside the checkout.
+Evidence is recorded in `results/phone-s1-summary.json` and
+`results/phone-fixed-acceptance.json` in the archived benchmark bundle.
 
 
 ### Recovered October 8 S1–S5 comparison
@@ -820,7 +819,7 @@ reporting status 1 with a cached `shell_skin` sample absent from current HAL
 readings. No thermal override was applied. The single synthesis is correctness
 evidence only; performance claims use the validated October 8 suite.
 
-## Codec weight reuse and F32 residual epilogues (QVAC-26841)
+## Codec weight reuse and F32 residual epilogues
 
 The new routes are experimental and disabled by default; the compiled DDR
 panel remains 4x2. Each optimization can be measured independently.
@@ -909,11 +908,10 @@ the work, artifacts/models are pinned, thermal status 0 is required before
 timing, and codes/WAVs must match across variants and repeats. The complete
 suite and its strictly validated results are reported below.
 
-Evidence beside the checkout: `hexagon-26841-build/results/` (including
+Evidence beside the checkout is in the archived benchmark results (including
 `matrix-kernels-full-a/summary.json` and `fusion-fixed-final-b/summary.json`),
-`hexagon-26841-build/assembly/fusion/provenance.json`, and frozen `stage/`
-artifacts. Device raw results: `/data/local/tmp/qvac-26841/results/`.
-Task: https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219396967417382.
+the fusion assembly provenance, and frozen staging artifacts. Device raw
+results are retained with the benchmark bundle.
 
 ### Four-variant end-to-end measurements, October 12
 
