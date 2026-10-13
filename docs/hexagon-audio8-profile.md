@@ -438,8 +438,8 @@ Local evidence resides under
 - `device-stage/benchmark.sh`: device runner; `single` reproduces the S1 protocol.
 - `summarize-benchmark.py`: reconstructs the summary from timestamps, logs, and WAVs.
 
-After staging the matching build and models in `/data/local/tmp/qvac-26715`,
-run `sh /data/local/tmp/qvac-26715/benchmark.sh single` on the device and capture
+After staging the matching build and models in `/data/local/tmp/audio8-hexagon`,
+run `sh /data/local/tmp/audio8-hexagon/benchmark.sh single` on the device and capture
 its output plus the generated `results/` files. Recompute the existing local
 summary from the ggml checkout with:
 
