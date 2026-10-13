@@ -15073,6 +15073,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {64, 64, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {77, 64, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
 
+    // Audio decode and masked prefill, including 14-head broadcast and short
+    // vector tails. Keep these separate from the large throughput probes.
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {9, 1, 1, 1}, false, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {30, 30, 1, 1}, true, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {95, 1, 1, 1}, false, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32000, 512, 1, 1}));

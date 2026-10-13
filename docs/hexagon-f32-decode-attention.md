@@ -29,11 +29,12 @@ experimental and opt-in.
 
 ## Short-row softmax
 
-For irregular F32 rows of at most 128 elements, the backend copies valid
-input/mask bytes into aligned VTCM and vectorizes scale, mask addition,
-maximum, exponential, sum and normalization. Padding uses negative infinity
-and its probabilities are explicitly zero. Valid bytes alone are copied
-back, including in-place operations. The existing aligned, longer-row and
+For irregular F32 rows of at most 128 elements, the backend fuses scale,
+mask addition and maximum while reading full input vectors. Partial vectors
+alone use bounded copies into aligned VTCM. Exponential, sum, reciprocal and
+normalization remain vectorized. Padding uses negative infinity and its
+probabilities are explicitly zero. Predicated stores write only valid output
+bytes, including in-place operations. The existing aligned, longer-row and
 F16-mask paths remain available. There is no new environment switch.
 
 ## Verification
