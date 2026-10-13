@@ -58,3 +58,23 @@ token disagreements in the report.
 
 Use profiling to confirm `FLASH_ATTN_EXT` reports `hvx-f32-decode`. Keep
 profiling disabled for timing comparisons and compare identical workloads.
+
+### Short-softmax measurements
+
+On the OnePlus CPH2723 (Hexagon v79, six HVX workers), three alternating
+baseline/candidate captures gave these median per-operation times. Each
+backend performance probe warms up and measures repeated operations for at
+least one second. Every capture started and ended at thermal status 0;
+starting skin temperature was at most 38.5 C.
+
+| Shape (14 heads) | Previous path | Vectorized path | Speedup |
+| --- | ---: | ---: | ---: |
+| 9 keys, 1 query, no mask | 4.16 us | 3.54 us | 1.18x |
+| 30 keys, 30 queries, F32 mask | 78.53 us | 53.76 us | 1.46x |
+| 95 keys, 1 query, no mask | 6.60 us | 4.15 us | 1.59x |
+
+These are repeated-operation measurements, not full Audio8 inference
+speedups. Decode flash attention also removes the standalone softmax
+operation, so the remaining application benefit primarily concerns masked
+prefill. An earlier implementation that copied whole rows and used a scalar
+reciprocal regressed these probes and was replaced before final validation.
