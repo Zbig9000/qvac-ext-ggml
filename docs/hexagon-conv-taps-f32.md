@@ -30,8 +30,10 @@ ordinary, dilated, and transposed cases at K=96, 192, and 384. A fixed-code
 operations confirmed in a separate profile. These checks cover the tested
 shapes and waveform; they do not establish universal numerical equivalence.
 
-Audio8 selects this experiment with `AUDIO8_CODEC_HEXAGON_CONV_TILE=1` before
-loading its decoder. Its independent `AUDIO8_CODEC_HEXAGON_FP16=1` experiment
+Audio8 selects this experiment with `AUDIO8_CODEC_HEXAGON_FP16=0` and
+`AUDIO8_CODEC_HEXAGON_CONV_TILE=1` before loading its decoder. Decoder
+synthesis now selects the independently measured HMX mode by default, with
+`AUDIO8_CODEC_HEXAGON_FP16=0` restoring F32 requests. The default mode
 uses existing HMX kernels through explicit default-precision synthesis
 products, without changing the F32 precision guard in the backend. HMX stages
 activations and output tiles as F16 and expands graph output to F32. The LM,
@@ -60,7 +62,9 @@ All runtime/model/script manifests and idle/thermal conditions pass; outputs
 are repeatable, and all five HMX PCM16 comparisons with preceding Hexagon
 pass the numerical gates. Separate batches, differing GPU trajectories and
 unrecorded actual DSP/DDR clocks limit performance claims to the measured
-prompt comparisons. Both new codec modes remain opt-in.
+prompt comparisons. Audio8 now makes the measured HMX mode the default;
+F32 convolution tiles remain opt-in. This changes application selection,
+with no new DSP arithmetic or timing suite for the default revision.
 
 See the [complete stage and waveform report](https://github.com/tetherto/qvac-fabric-speech.cpp/blob/feat/audio8-hexagon-attention/engines/tts/docs/audio8-hexagon-codec-tracks.md)
 for independent LM/codec medians, ranges, frame counts, reproduction and
