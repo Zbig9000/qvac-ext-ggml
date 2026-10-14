@@ -21,11 +21,12 @@ accumulation preserve F32; key prefixes can span multiple 128-key tiles.
 Invalid tail probabilities are zeroed explicitly. Only valid output
 head dimensions are written.
 
-Audio8 can enable this route with `AUDIO8_LM_HEXAGON_FLASH_ATTN=1` in the
+Audio8 uses this route by default on supported Hexagon backends in the
 companion speech implementation, which selects a position-major V cache at
-model load. Masked prefill materializes its channel-major value operand
-without changing the persistent cache layout. The application option is
-experimental and opt-in.
+model load. `AUDIO8_LM_HEXAGON_FLASH_ATTN=0` selects separate attention;
+leaving it unset or setting it to `1` uses the default flash path. Masked
+prefill materializes its channel-major value operand without changing the
+persistent cache layout. Unsupported operations retain separate attention.
 
 ## Short-row softmax
 
@@ -35,7 +36,8 @@ alone use bounded copies into aligned VTCM. Exponential, sum, reciprocal and
 normalization remain vectorized. Padding uses negative infinity and its
 probabilities are explicitly zero. Predicated stores write only valid output
 bytes, including in-place operations. The existing aligned, longer-row and
-F16-mask paths remain available. There is no new environment switch.
+F16-mask paths remain available. The vectorized short-row route is selected
+automatically for applicable shapes, with no new environment switch.
 
 ## Verification
 
@@ -88,18 +90,29 @@ profiles; generated codes match each runtime's unprofiled replay. Q8 LM
 projections account for 76.13% of remaining candidate leaf cycles, led by
 the 896x9728 gated FFN and 4864x896 residual down-projection families.
 
-The full application suite completes 80 captures across S1-S5, with three
-warmups and five timed runs per variant/prompt. Full inference results are
+The original full application suite completes 80 captures across S1-S5, with
+three warmups and five timed runs per variant/prompt. Full inference results are
 mixed: S1/S2 improve, S4 improves modestly, S3 regresses and S5 is roughly
 unchanged. Native frame counts differ and timings vary, so these results
 do not establish a universal end-to-end speedup.
+
+The October 14 follow-ups retain S1/S2 from that suite and replace S3/S5 and
+S4 with three timed observations per variant. Latest full inference medians
+(baseline/candidate seconds) are S1 6.474/5.200, S2 4.130/3.539,
+S3 6.717/4.931, S4 5.144/6.804 and S5 7.103/6.626. Independent LM medians
+are lower for all five prompts. The S4 full-inference regression is in codec
+synthesis; identical 81-frame candidate outputs have codec times spanning
+1.743-5.019 s. Neither the timing variation nor its kernel cause is resolved.
+The companion report retains original and follow-up measurements with their
+sample counts and different generated workloads.
 
 The final backend passes 84 softmax, 39 decode-attention and three large-logit
 CPU-reference cases; 20 production cache comparisons also pass. Full
 teacher-forced LM gates are not universally met: 1,026 numerical misses and
 105 CPU top1 differences, versus 1,034 and 104 previously. All 25 fixed-code
 codec boundaries pass and match preceding Hexagon tensors byte-for-byte.
-Keep the application option experimental and opt-in.
+The companion application now defaults to supported flash decode and retains
+an explicit opt-out. Short softmax is already automatic for applicable shapes.
 
 See the companion [Audio8 validation report](https://github.com/tetherto/qvac-fabric-speech.cpp/blob/feat/audio8-hexagon-attention/engines/tts/docs/audio8-hexagon-attention.md)
 for stage medians, run ranges, generated frame counts, CPU comparisons,
