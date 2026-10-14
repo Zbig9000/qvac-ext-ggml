@@ -64,7 +64,14 @@ pass the numerical gates. Separate batches, differing GPU trajectories and
 unrecorded actual DSP/DDR clocks limit performance claims to the measured
 prompt comparisons. Audio8 now makes the measured HMX mode the default;
 F32 convolution tiles remain opt-in. This changes application selection,
-with no new DSP arithmetic or timing suite for the default revision.
+with no new DSP arithmetic. A subsequent default-path S4 recheck used one
+warmup and five timed Hexagon captures, all with identical codes/WAVs to the
+explicit HMX path. The five times were 3.4484, 4.2411, 3.1218, 3.0297 and
+3.7788 seconds; median 3.4484 seconds and RTF 0.916729601 for 3.761632653
+seconds of generated audio. RTF is inference time divided by exact WAV
+duration, with lower values better. All idle/thermal conditions and manifests
+pass. Saved OpenCL S4 has 3.1466 seconds latency, RTF 1.011289208, and shorter
+audio (67 frames versus 81); this remains a prompt-level comparison.
 
 See the [complete stage and waveform report](https://github.com/tetherto/qvac-fabric-speech.cpp/blob/feat/audio8-hexagon-attention/engines/tts/docs/audio8-hexagon-codec-tracks.md)
 for independent LM/codec medians, ranges, frame counts, reproduction and
