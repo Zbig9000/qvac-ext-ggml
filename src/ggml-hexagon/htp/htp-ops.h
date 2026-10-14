@@ -117,6 +117,7 @@ enum htp_op_code {
     HTP_OP_COS,
     HTP_OP_UPSCALE,
     HTP_OP_ARGMAX,
+    HTP_OP_CONV_TAPS_F32,
 
     HTP_OP_INVALID
 };
@@ -126,6 +127,14 @@ enum htp_op_code {
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 #define HTP_OP_MAX_KERN_PARAMS 32
+
+struct htp_conv_taps_params {
+    int32_t tap_step;
+    uint32_t first_row;
+    uint32_t tile_rows;
+    uint32_t worker_bytes;
+    uint32_t vtcm_size;
+};
 
 #define HTP_OP_MAX_BUFS    16
 #define HTP_OP_MAX_TENSORS 8192 // must stay under 64K (uint16)

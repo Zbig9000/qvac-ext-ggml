@@ -153,6 +153,9 @@ struct htp_opnode {
     }
 
     std::string op_name() const {
+        if (opcode == HTP_OP_CONV_TAPS_F32) {
+            return "CONV_TAPS_F32";
+        }
         if (fused.empty()) {
             return ggml_op_desc(node);
         }
@@ -349,6 +352,12 @@ struct htp_opformat {
         }
     }
     void format_kernel_params(char * str, size_t max_size, const htp_opnode & node) {
+        if (node.opcode == HTP_OP_CONV_TAPS_F32) {
+            const auto * p = (const struct htp_conv_taps_params *) node.kernel_params;
+            snprintf(str, max_size, "hvx-conv-taps-f32 rows %u step %d vtcm %u",
+                     p->tile_rows, p->tap_step, p->vtcm_size);
+            return;
+        }
         if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID ||
             node.opcode == HTP_OP_MUL_MAT_QKV || node.opcode == HTP_OP_MUL_MAT_FFN ||
             node.opcode == HTP_OP_MUL_MAT_ADD) {
