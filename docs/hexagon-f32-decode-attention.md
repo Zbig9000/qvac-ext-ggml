@@ -78,3 +78,29 @@ speedups. Decode flash attention also removes the standalone softmax
 operation, so the remaining application benefit primarily concerns masked
 prefill. An earlier implementation that copied whole rows and used a scalar
 reciprocal regressed these probes and was replaced before final validation.
+
+### Application measurements and limits
+
+The final 66-frame Audio8 fixed-entry replay profile reduces attention core
+event time from 301.860 ms to 75.868 ms, with 4,200 `hvx-f32-decode` calls.
+Layout CONT calls decrease from 4,404 to 228. These are separate diagnostic
+profiles; generated codes match each runtime's unprofiled replay. Q8 LM
+projections account for 76.13% of remaining candidate leaf cycles, led by
+the 896x9728 gated FFN and 4864x896 residual down-projection families.
+
+The full application suite completes 80 captures across S1-S5, with three
+warmups and five timed runs per variant/prompt. Full inference results are
+mixed: S1/S2 improve, S4 improves modestly, S3 regresses and S5 is roughly
+unchanged. Native frame counts differ and timings vary, so these results
+do not establish a universal end-to-end speedup.
+
+The final backend passes 84 softmax, 39 decode-attention and three large-logit
+CPU-reference cases; 20 production cache comparisons also pass. Full
+teacher-forced LM gates are not universally met: 1,026 numerical misses and
+105 CPU top1 differences, versus 1,034 and 104 previously. All 25 fixed-code
+codec boundaries pass and match preceding Hexagon tensors byte-for-byte.
+Keep the application option experimental and opt-in.
+
+See the companion [Audio8 validation report](https://github.com/tetherto/qvac-fabric-speech.cpp/blob/feat/audio8-hexagon-attention/engines/tts/docs/audio8-hexagon-attention.md)
+for stage medians, run ranges, generated frame counts, CPU comparisons,
+output recognition transcripts, commands and runtime hashes.
