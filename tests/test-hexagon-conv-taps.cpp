@@ -58,7 +58,7 @@ static bool check(ggml_backend_t backend, ggml_backend_hexagon_conv_taps_f32_t c
     if (std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(float))) {
         std::fprintf(stderr, "legacy mismatch k=%d step=%d\n", k, step); return false;
     }
-    // Sample every worker/tile boundary and both sequence ends independently.
+    // Sample selected worker/tile boundaries and both sequence ends independently.
     const int boundaries[] = {0, 1, 63, 64, 65, 127, 128, 319, 320, 383, 384, rows - 2, rows - 1};
     for (int r : boundaries) for (int c = 0; c < channels; ++c) {
         float sum = 0;
