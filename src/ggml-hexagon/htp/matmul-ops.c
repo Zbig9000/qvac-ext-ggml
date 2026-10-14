@@ -3921,6 +3921,85 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     return HTP_STATUS_OK;
 }
 
+// A complete output tile remains in VTCM across convolution taps. Every tap
+// uses the DDR panel's F32 reduction and product-rounding barrier, followed by
+// the same standalone F32 ADD. Only the completed tile is copied to DDR.
+static void hvx_conv_taps_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_ops_context * octx = data;
+    const struct htp_conv_taps_params * p = (const struct htp_conv_taps_params *) octx->kernel_params;
+    const struct htp_tensor * w = octx->src[0];
+    const struct htp_tensor * x = octx->src[1];
+    const struct htp_tensor * dst = octx->dst;
+    const uint32_t channels = dst->ne[0];
+    const uint32_t rows = dst->ne[1];
+    const uint32_t blocks = 1 + (rows - 1) / p->tile_rows;
+    float * tile = (float *) (octx->ctx->vtcm_base + (size_t) ith * p->worker_bytes);
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, 0);
+    for (uint32_t block = ith; block < blocks; block += nth) {
+        const uint32_t first = block * p->tile_rows;
+        const uint32_t count = MIN(p->tile_rows, rows - first);
+        for (uint32_t tap = 0; tap < w->ne[2]; ++tap) {
+            const uint8_t * weights = (const uint8_t *) w->data + (size_t) tap * w->nb[2];
+            for (uint32_t r = 0; r < count; r += 2) {
+                const int64_t pos = (int64_t) p->first_row + first + r + (int64_t) tap * p->tap_step;
+                const uint8_t * a0 = (const uint8_t *) x->data + (size_t) pos * x->nb[1];
+                float * d0 = tile + (size_t) r * channels;
+                if (r + 1 < count) {
+                    const uint8_t * a1 = a0 + x->nb[1];
+                    float * d1 = d0 + channels;
+                    for (uint32_t c = 0; c < channels; c += 4) {
+                        const uint8_t * w0 = weights + (size_t) c * w->nb[1];
+                        vec_dot_f16_f32_uu_4x2_residual(w->ne[0], d0 + c, d1 + c,
+                            w0, w0 + w->nb[1], w0 + 2 * w->nb[1], w0 + 3 * w->nb[1],
+                            a0, a1, tap ? d0 + c : NULL, tap ? d1 + c : NULL, tr);
+                    }
+                } else {
+                    for (uint32_t c = 0; c < channels; ++c) {
+                        vec_dot_f16_f32_panel_1x1_residual(w->ne[0], d0 + c,
+                            weights + (size_t) c * w->nb[1], a0, tap ? d0 + c : NULL, tr);
+                    }
+                }
+            }
+        }
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, count);
+        memcpy((uint8_t *) dst->data + (size_t) first * dst->nb[1], tile,
+               (size_t) count * channels * sizeof(float));
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, count);
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, 0);
+}
+
+int op_conv_taps_f32(struct htp_ops_context * octx) {
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) return HTP_STATUS_OK;
+    const struct htp_conv_taps_params * p = (const struct htp_conv_taps_params *) octx->kernel_params;
+    const struct htp_tensor * w = octx->src[0];
+    const struct htp_tensor * x = octx->src[1];
+    const struct htp_tensor * d = octx->dst;
+    if (!w || !x || !d || w->type != HTP_TYPE_F16 || x->type != HTP_TYPE_F32 || d->type != HTP_TYPE_F32 ||
+        w->ne[0] < 64 || w->ne[0] % 32 || w->ne[1] % 4 || w->ne[2] < 2 || w->ne[2] > 16 ||
+        w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || d->ne[2] != 1 || d->ne[3] != 1 ||
+        d->ne[0] != w->ne[1] || x->ne[0] != w->ne[0] || !d->ne[0] || !d->ne[1] ||
+        w->nb[0] != 2 || w->nb[1] != w->ne[0] * 2 || w->nb[2] != w->nb[1] * w->ne[1] ||
+        x->nb[0] != 4 || x->nb[1] != x->ne[0] * 4 || d->nb[0] != 4 || d->nb[1] != d->ne[0] * 4 ||
+        (p->tap_step != -1 && (p->tap_step < 1 || p->tap_step > 64)) ||
+        p->first_row != (p->tap_step < 0 ? w->ne[2] - 1 : 0) || p->tile_rows != 64) return HTP_STATUS_NO_SUPPORT;
+    const uint32_t distance = p->tap_step < 0 ? -p->tap_step : p->tap_step;
+    const uint64_t required_rows = (uint64_t) d->ne[1] + (uint64_t) (w->ne[2] - 1) * distance;
+    if (required_rows > x->ne[1] ||
+        (uint64_t) w->nb[2] * w->ne[2] > w->size ||
+        (uint64_t) x->nb[1] * required_rows > x->size ||
+        (uint64_t) d->nb[1] * d->ne[1] > d->size ||
+        !htp_mm_f16_f32_disjoint(d->data, d->size, w->data, w->size) ||
+        !htp_mm_f16_f32_disjoint(d->data, d->size, x->data, x->size)) return HTP_STATUS_NO_SUPPORT;
+    if (p->worker_bytes < (uint64_t) p->tile_rows * d->ne[0] * sizeof(float) ||
+        p->worker_bytes % 128 || !octx->n_threads ||
+        (uint64_t) p->worker_bytes * octx->n_threads > p->vtcm_size ||
+        p->vtcm_size > octx->ctx->vtcm_size) return HTP_STATUS_VTCM_TOO_SMALL;
+    worker_pool_run_func(octx->ctx->worker_pool, hvx_conv_taps_thread, octx, octx->n_threads);
+    return HTP_STATUS_OK;
+}
+
 // K=9 im2col has very short dot products and many spatial rows. Stage one
 // bounded tile in tap-major order, then reuse it for every output channel.
 // Half inputs are retained exactly and accumulation/output use FP32. This

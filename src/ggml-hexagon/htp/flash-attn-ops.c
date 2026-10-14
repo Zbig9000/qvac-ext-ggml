@@ -2556,7 +2556,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         return hmx_flash_attn_ext(octx);
     }
 
-    if (kparams->kernel_type == HTP_FA_KERNEL_HVX_F32) {
+    if (kparams->kernel_type == HTP_FA_KERNEL_HVX_F32 ||
+        kparams->kernel_type == HTP_FA_KERNEL_HVX_F32_DECODE) {
         return op_flash_attn_ext_f32(octx);
     }
 

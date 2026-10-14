@@ -2243,7 +2243,13 @@ static void ggml_hexagon_precompute_flash_attn_f32_params(const struct ggml_hexa
     kparams->n_threads   = sess->n_threads;
 
     struct hvx_fa_f32_vtcm_layout L;
-    hvx_fa_f32_vtcm_layout_build(&L, q->ne[0], v->ne[0], kparams->Br, kparams->Bc, sess->n_threads);
+    if (q->ne[1] == 1) {
+        kparams->kernel_type = HTP_FA_KERNEL_HVX_F32_DECODE;
+        kparams->Br = 1;
+        hvx_fa_f32_decode_vtcm_layout_build(&L, q->ne[0], v->ne[0], sess->n_threads);
+    } else {
+        hvx_fa_f32_vtcm_layout_build(&L, q->ne[0], v->ne[0], kparams->Br, kparams->Bc, sess->n_threads);
+    }
     kparams->vtcm_size = L.total_bytes;
 
     kparams->broadcast_rk2 = init_fastdiv_values(q->ne[2] / k->ne[2]);
@@ -2966,6 +2972,100 @@ static void ggml_hexagon_precompute_matmul_params(
     struct htp_mm_kernel_params * kparams
 ) {
     ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, 0, kparams);
+}
+
+// A CPU fallback makes this a regular CUSTOM operation. The DSP recognizes
+// this exact callback; it never interprets or invokes a host function pointer.
+static void ggml_hexagon_conv_taps_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * w = dst->src[0];
+    const auto * x = dst->src[1];
+    const int step = int(reinterpret_cast<intptr_t>(userdata));
+    const int64_t first = step < 0 ? w->ne[2] - 1 : 0;
+    for (int64_t r = ith; r < dst->ne[1]; r += nth) {
+        float * out = reinterpret_cast<float *>(static_cast<uint8_t *>(dst->data) + r * dst->nb[1]);
+        for (int64_t c = 0; c < dst->ne[0]; ++c) {
+            float total = 0.0f;
+            for (int64_t t = 0; t < w->ne[2]; ++t) {
+                const auto * weights = reinterpret_cast<const ggml_fp16_t *>(
+                    static_cast<const uint8_t *>(w->data) + t * w->nb[2] + c * w->nb[1]);
+                const auto * input = reinterpret_cast<const float *>(
+                    static_cast<const uint8_t *>(x->data) + (first + r + t * step) * x->nb[1]);
+                float product = 0.0f;
+                for (int64_t k = 0; k < w->ne[0]; ++k) {
+                    const volatile float term = ggml_fp16_to_fp32(weights[k]) * input[k];
+                    product += term;
+                }
+                const volatile float rounded = product;
+                total = t == 0 ? rounded : total + rounded;
+            }
+            out[c] = total;
+        }
+    }
+}
+
+static bool ggml_hexagon_conv_taps_params(const ggml_hexagon_session * sess, const ggml_tensor * op,
+                                         htp_conv_taps_params * p) {
+    if (op->op != GGML_OP_CUSTOM) return false;
+    ggml_custom_op_params custom;
+    memcpy(&custom, op->op_params, sizeof(custom));
+    if (custom.fun != ggml_hexagon_conv_taps_cpu) return false;
+    const auto * w = op->src[0];
+    const auto * x = op->src[1];
+    if (!w || !x || w->type != GGML_TYPE_F16 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        w->ne[0] < 64 || w->ne[0] % 32 || w->ne[1] < 4 || w->ne[1] % 4 ||
+        w->ne[2] < 2 || w->ne[2] > 16 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        op->ne[2] != 1 || op->ne[3] != 1 || op->ne[0] != w->ne[1] || x->ne[0] != w->ne[0] ||
+        op->ne[1] <= 0 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(op)) return false;
+    for (int i = 2; i < GGML_MAX_SRC; ++i) if (op->src[i]) return false;
+    const intptr_t encoded = reinterpret_cast<intptr_t>(custom.userdata);
+    if (encoded != -1 && (encoded < 1 || encoded > 64)) return false;
+    const int step = int(encoded);
+    const int distance = step < 0 ? -step : step;
+    if (x->ne[1] < op->ne[1] + (w->ne[2] - 1) * distance || sess->n_threads == 0) return false;
+
+    // Preserve efficient existing VTCM products. Only replace the DDR 4x2
+    // products whose full-size tap intermediates would otherwise reach DDR.
+    ggml_tensor weights = *w, input = *x, product = *op;
+    weights.ne[2] = weights.ne[3] = 1;
+    input.ne[1] = op->ne[1];
+    input.nb[2] = input.nb[1] * input.ne[1];
+    input.nb[3] = input.nb[2];
+    product.op = GGML_OP_MUL_MAT;
+    product.op_params[0] = GGML_PREC_F32;
+    product.src[0] = &weights;
+    product.src[1] = &input;
+    htp_mm_kernel_params mm = {};
+    ggml_hexagon_precompute_matmul_params(sess, &weights, &input, &product, &mm);
+    if (mm.kernel_type != HTP_MM_KERNEL_HVX_F16_F32_DDR || mm.tile_size != HTP_MM_F16_F32_PANEL_4X2) return false;
+
+    const uint64_t worker_bytes = (uint64_t(64) * op->ne[0] * sizeof(float) + 127) & ~uint64_t(127);
+    const uint64_t total = worker_bytes * sess->n_threads;
+    if (total > sess->vtcm_size || total > UINT32_MAX) return false;
+    *p = {step, uint32_t(step < 0 ? w->ne[2] - 1 : 0), 64, uint32_t(worker_bytes), uint32_t(total)};
+    return true;
+}
+
+ggml_tensor * ggml_backend_hexagon_conv_taps_f32(ggml_context * ctx, ggml_backend_t backend,
+                                               ggml_tensor * w, ggml_tensor * x, int step, int rows) {
+    if (!ctx || !ggml_backend_is_hexagon(backend) || !w || !x || rows <= 0) return nullptr;
+    ggml_tensor probe = {};
+    probe.type = GGML_TYPE_F32;
+    probe.op = GGML_OP_CUSTOM;
+    probe.ne[0] = w->ne[1]; probe.ne[1] = rows; probe.ne[2] = probe.ne[3] = 1;
+    probe.nb[0] = sizeof(float); probe.nb[1] = probe.ne[0] * probe.nb[0];
+    probe.nb[2] = probe.nb[1] * rows; probe.nb[3] = probe.nb[2];
+    probe.src[0] = w; probe.src[1] = x;
+    ggml_custom_op_params custom = {ggml_hexagon_conv_taps_cpu, GGML_N_TASKS_MAX,
+                                    reinterpret_cast<void *>(intptr_t(step))};
+    memcpy(probe.op_params, &custom, sizeof(custom));
+    htp_conv_taps_params params;
+    const auto * sess = static_cast<const ggml_hexagon_session *>(backend->context);
+    if (!ggml_hexagon_conv_taps_params(sess, &probe, &params)) return nullptr;
+    ggml_tensor * args[] = {w, x};
+    auto * out = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[1], rows, 1, 1, args, 2,
+                              custom.fun, custom.n_tasks, custom.userdata);
+    ggml_set_name(out, "hexagon.conv_taps_f32");
+    return out;
 }
 
 // The MUL_MAT node, not the ADD, decides the kernel: it carries the requested
@@ -4038,6 +4138,7 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
 
 static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
     switch (t->op) {
+        case GGML_OP_CUSTOM:         return HTP_OP_CONV_TAPS_F32;
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
         case GGML_OP_MUL_MAT:         return HTP_OP_MUL_MAT;
         case GGML_OP_MUL_MAT_ID:      return HTP_OP_MUL_MAT_ID;
@@ -4381,6 +4482,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     node.node,
                     (struct htp_fa_kernel_params *)node.kernel_params
                 );
+            } else if (node.opcode == HTP_OP_CONV_TAPS_F32) {
+                if (!ggml_hexagon_conv_taps_params(sess, node.node,
+                        (struct htp_conv_taps_params *) node.kernel_params)) {
+                    GGML_ABORT("ggml-hex: unsupported F32 convolution tile\n");
+                }
             } else if (htp_op_is_unary(node.opcode)) {
                 auto inputs = node.get_inputs();
                 const struct ggml_tensor * src0 = inputs[0];
@@ -4774,6 +4880,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
     bool supp = false;
     switch (op->op) {
+        case GGML_OP_CUSTOM: {
+            htp_conv_taps_params params;
+            supp = ggml_hexagon_conv_taps_params(sess, op, &params);
+            break;
+        }
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -5066,6 +5177,9 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
 }
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_hexagon_conv_taps_f32") == 0) {
+        return (void *) ggml_backend_hexagon_conv_taps_f32;
+    }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 && opt_hostbuf) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_hexagon_device_get_extra_buffers_type;
         return (void *) fct;

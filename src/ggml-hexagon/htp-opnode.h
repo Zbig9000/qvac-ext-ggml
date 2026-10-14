@@ -153,6 +153,9 @@ struct htp_opnode {
     }
 
     std::string op_name() const {
+        if (opcode == HTP_OP_CONV_TAPS_F32) {
+            return "CONV_TAPS_F32";
+        }
         if (fused.empty()) {
             return ggml_op_desc(node);
         }
@@ -349,6 +352,12 @@ struct htp_opformat {
         }
     }
     void format_kernel_params(char * str, size_t max_size, const htp_opnode & node) {
+        if (node.opcode == HTP_OP_CONV_TAPS_F32) {
+            const auto * p = (const struct htp_conv_taps_params *) node.kernel_params;
+            snprintf(str, max_size, "hvx-conv-taps-f32 rows %u step %d vtcm %u",
+                     p->tile_rows, p->tap_step, p->vtcm_size);
+            return;
+        }
         if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID ||
             node.opcode == HTP_OP_MUL_MAT_QKV || node.opcode == HTP_OP_MUL_MAT_FFN ||
             node.opcode == HTP_OP_MUL_MAT_ADD) {
@@ -394,6 +403,10 @@ struct htp_opformat {
                 path = kparams->u.hmx.pipeline ? "hmx-pipe" : "hmx-seq";
             } else if (type == HTP_FA_KERNEL_HVX) {
                 path = "hvx";
+            } else if (type == HTP_FA_KERNEL_HVX_F32) {
+                path = "hvx-f32";
+            } else if (type == HTP_FA_KERNEL_HVX_F32_DECODE) {
+                path = "hvx-f32-decode";
             }
             snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
         } else if (htp_op_is_unary(node.opcode)) {

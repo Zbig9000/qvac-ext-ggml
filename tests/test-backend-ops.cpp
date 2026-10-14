@@ -6615,7 +6615,7 @@ struct test_audio8_codec_f32 : public test_mul_mat_prec_f32 {
 };
 
 static void add_audio8_codec_f32_perf_tests(std::vector<std::unique_ptr<test_case>> & cases) {
-    // QVAC-26714's complete S1 trace: the three dominant F32-required DDR
+    // Complete S1 trace: the three dominant F32-required DDR
     // families. Keep the longer historical probes below for scaling checks.
     cases.emplace_back(new test_audio8_codec_f32(96, 135168));
     cases.emplace_back(new test_audio8_codec_f32(192, 67584));
@@ -13977,6 +13977,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, mask, sinks, GGML_TYPE_F16, {1, 1}, 0.1f, 0.0f, true));
         }
     }
+    // Short attention rows: vector tails, mask broadcasting over 14 heads,
+    // multiple batches, and in-place operation. Adjacent aligned lengths keep
+    // the existing wide-row path covered by the same CPU reference gate.
+    for (int cols : {1, 3, 9, 30, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129}) {
+        for (bool mask : {false, true}) {
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 1, 1, 1},
+                mask, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 30, 1, 1},
+                mask, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 3, 1, 1},
+                mask, false, GGML_TYPE_F32, {2, 3}, 0.125f, mask ? 8.0f : 0.0f, true));
+        }
+    }
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, true,  true,  GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, true,  false, GGML_TYPE_F16, {1, 1}, 0.1f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, false, true,  GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f));
@@ -14490,6 +14503,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // Single-query F32 attention: grouped heads, strided position-major caches,
+    // short prefixes, and online-softmax key tile boundaries.
+    for (int hs : {32, 64, 128, 256}) {
+        for (int kv : {1, 9, 31, 32, 95, 127, 128, 129, 257}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {7, 1}, kv, 1,
+                false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 2, 1, 3}));
+        }
+    }
+    // Batched heads exercise the fourth-dimension row offsets too.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {7, 3}, 129, 1,
+        false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 128, 2, {7, 1}, 129, 1,
+        false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 64, 2, {7, 3}, 257, 1,
+        false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext_sink_logits(64, 2, 257, 1, 2, 900.0f, 0.05f));
+    test_cases.emplace_back(new test_flash_attn_ext_sink_logits(128, 2, 129, 1, 1, 400.0f, 0.1f));
 
     // F32-KV cases matching the Parakeet Conformer attention shapes exercised by the
     // Hexagon backend. Q is F32 by default in this harness; K/V are F32 here.
@@ -15041,6 +15072,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {256, 256, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {64, 64, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {77, 64, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+
+    // Audio decode and masked prefill, including 14-head broadcast and short
+    // vector tails. Keep these separate from the large throughput probes.
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {9, 1, 1, 1}, false, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {30, 30, 1, 1}, true, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {95, 1, 1, 1}, false, false, GGML_TYPE_F32, {14, 1}, 0.125f, 0.0f));
 
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
