@@ -862,8 +862,8 @@ static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
     }
 }
 
-static inline void mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
-    if (b->base) return; // already mapped
+static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+    if (b->base) return true; // already mapped
 
     // find unused mapping
     for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
@@ -880,8 +880,8 @@ static inline void mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
             void *va = HAP_mmap(NULL, b->size, HAP_PROT_READ | HAP_PROT_WRITE, 0, b->fd, 0);
 #endif
             if (va == (void*)-1) {
-                FARF(ERROR, "mmap failed : va %p fd %u size %u", va, b->fd, (uint32_t) b->size);
-                abort(); // can't do much else at this point
+                FARF(HIGH, "mmap failed (will attempt defrag) : fd %u size %u", b->fd, (uint32_t) b->size);
+                return false;
             }
 
             m->base   = b->base = (uint64_t) va;
@@ -889,9 +889,12 @@ static inline void mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
             m->size   = b->size;
 
             FARF(HIGH, "mmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
-            return;
+            return true;
         }
     }
+
+    FARF(HIGH, "mmap failed (will attempt defrag) : all %u mapping slots are in use", HTP_MAX_MMAPS);
+    return false;
 }
 
 static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
@@ -924,11 +927,33 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
         }
     }
 
-    // Create missing mappings
+    // Create missing mappings (pass 1)
+    bool mmap_ok = true;
     for (uint32_t i=0; i < n_bufs; i++) {
         struct htp_buf_desc *b = bufs + i;
-        mmap_buf(ctx, b);
+        if (!mmap_buf(ctx, b)) {
+            mmap_ok = false;
+            break;
+        }
         FARF(HIGH, "prep-buf #%u : pass1 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
+    }
+
+    if (!mmap_ok) {
+        // Out of mapping slots or contiguous address space: drop every mapping and remap this batch (pass 2)
+        FARF(HIGH, "prep-bufs : dropping all mappings to defragment address space");
+        for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
+            drop_mmap(ctx, ctx->mmap + i);
+        }
+
+        for (uint32_t i=0; i < n_bufs; i++) {
+            struct htp_buf_desc *b = bufs + i;
+            b->base = 0;
+            if (!mmap_buf(ctx, b)) {
+                FARF(ERROR, "prep-bufs : mmap failed after defragmentation (fd %u size %u)", b->fd, (uint32_t) b->size);
+                abort();
+            }
+            FARF(HIGH, "prep-buf #%u : pass2 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
+        }
     }
 }
 
