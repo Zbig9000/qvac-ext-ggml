@@ -1385,8 +1385,8 @@ struct ggml_hexagon_opbatch {
         if (found >= 0) { return found; }
 
         // Add new buffer to the batch
-        int bi = n_bufs++;
         GGML_ASSERT(n_bufs < HTP_OP_MAX_BUFS);
+        int bi = n_bufs++;
 
         htp_buf_desc &b = h_bufs[bi];
         b.base = (uint64_t) sbuf->base;
