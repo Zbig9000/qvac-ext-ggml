@@ -401,6 +401,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-opencl.h
+    include/ggml-hexagon.h
     include/ggml-metal.h
     include/ggml-rpc.h
     include/ggml-virtgpu.h

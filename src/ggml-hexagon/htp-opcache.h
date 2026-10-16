@@ -12,6 +12,7 @@ class htp_op_cache {
 public:
     void resize(size_t depth) { slots.resize(depth); }
     size_t size() const { return slots.size(); }
+    const std::vector<std::vector<htp_opnode>> & entries() const { return slots; }
 
     void capture(size_t slot, const std::vector<htp_opnode> & ops, size_t count) {
         GGML_ASSERT(slot < slots.size() && count <= ops.size());
