@@ -48,6 +48,7 @@
 #include "ggml-quants.h"
 #include "htp-opnode.h"
 #include "htp-opcache.h"
+#include "htp-runtime-info.h"
 #include "htp-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
@@ -338,6 +339,9 @@ struct ggml_hexagon_opqueue;
 struct htp_opnode;
 
 struct ggml_hexagon_session {
+    // Registry-owned sessions may be shared by independent backend handles.
+    // Protect retained graph/queue metadata, including runtime snapshots.
+    std::mutex metadata_mutex;
     std::string      name;
     remote_handle64  handle;
     dspqueue_t       queue;
@@ -363,6 +367,11 @@ struct ggml_hexagon_session {
     uint64_t vtcm_size = 0;
     size_t   max_vmem  = 0;
     size_t   max_bufsize = 0;
+    uint32_t runtime_op_stage = 0;
+    size_t runtime_batch_size = 0;
+    size_t runtime_queue_depth = 0;
+    size_t runtime_request_bytes = 0;
+    size_t runtime_response_bytes = 0;
 
     struct {
         uint64_t uid = 0;
@@ -2041,6 +2050,11 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
 
     const size_t req_q_size = (sizeof(htp_opbatch_req) * opt_opqueue * 2) + 1024;
     const size_t rsp_q_size = (sizeof(htp_opbatch_rsp) * opt_opqueue * 2) + 1024;
+    this->runtime_op_stage = opt_opstage;
+    this->runtime_batch_size = opt_opbatch;
+    this->runtime_queue_depth = opt_opqueue;
+    this->runtime_request_bytes = req_q_size;
+    this->runtime_response_bytes = rsp_q_size;
 
     // Now let's setup the DSP queue
     err = dspqueue_create(this->domain_id,
@@ -4127,6 +4141,7 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     if (opt_profile) {
         auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+        std::lock_guard<std::mutex> lock(sess->metadata_mutex);
         if (sess->op_queue) {
             sess->op_queue->dump_host_profile();
         }
@@ -4427,6 +4442,7 @@ static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph *
 
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    std::lock_guard<std::mutex> lock(sess->metadata_mutex);
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
@@ -4523,6 +4539,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
 static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    std::lock_guard<std::mutex> lock(sess->metadata_mutex);
 
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
@@ -5176,7 +5193,111 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
     return &hreg->devices[index];
 }
 
+static void ggml_hexagon_count_session(htp_memory_count & host, htp_memory_count & shared,
+        const ggml_hexagon_session & sess, uint64_t max_graph_nodes, uint64_t page) {
+    host.add(sizeof(sess));
+    host.add(sess.name.capacity() + 1);
+    for (auto buft : { &sess.buffer_type, &sess.repack_buffer_type }) {
+        const auto * context = static_cast<const ggml_backend_hexagon_buffer_type_context *>(buft->context);
+        host.add(sizeof(*context));
+        host.add(context->name.capacity() + 1);
+    }
+
+    const auto & batch = *sess.op_batch;
+    host.add(sizeof(batch));
+    htp_runtime_count_nodes(host, batch.ops);
+    host.array(batch.h_bufs.capacity(), sizeof(htp_buf_desc));
+    host.array(batch.h_tens.capacity(), sizeof(htp_tensor));
+    host.array(batch.h_ops.capacity(), sizeof(htp_op_desc));
+    host.array(batch.t_index.slots.capacity(), sizeof(htp_pointer_index::slot));
+    host.array(batch.d_index.slots.capacity(), sizeof(htp_pointer_index::slot));
+    htp_runtime_count_nodes(host, sess.cached_graph.htp_nodes);
+
+    const auto & queue = *sess.op_queue;
+    host.add(sizeof(queue));
+    host.add(sizeof(*queue.shm_buf));
+    host.array(queue.start_usec.capacity(), sizeof(uint64_t));
+    const auto & slots = queue.op_cache.entries();
+    host.array(slots.capacity(), sizeof(std::vector<htp_opnode>));
+    for (const auto & slot : slots) {
+        htp_runtime_count_nodes(host, slot);
+    }
+    // std::queue has no capacity query. Allow spare deque blocks and its map;
+    // this is payload headroom, independent of the allocator/vendor margin.
+    host.add(4096);
+    host.array(sess.runtime_queue_depth, 4 * sizeof(unsigned int));
+
+    htp_runtime_future_metadata(host, max_graph_nodes, sess.runtime_batch_size,
+            sess.runtime_queue_depth, sizeof(htp_opnode), sizeof(ggml_tensor *));
+
+    shared.pages(queue.shm_buf->size, page);
+    shared.pages(sess.runtime_request_bytes, page);
+    shared.pages(sess.runtime_response_bytes, page);
+}
+
+bool ggml_backend_hexagon_get_runtime_info_v1(ggml_backend_t backend, uint64_t max_graph_nodes,
+        struct ggml_backend_hexagon_runtime_info_v1 * out, size_t info_size) {
+    if (!out || info_size != sizeof(*out) || max_graph_nodes > INT32_MAX ||
+            !ggml_backend_is_hexagon(backend) || !backend->device || !backend->device->reg) {
+        return false;
+    }
+    auto * selected = static_cast<ggml_hexagon_session *>(backend->context);
+    auto * registry = static_cast<ggml_hexagon_registry *>(backend->device->reg->context);
+    if (!selected || !registry) {
+        return false;
+    }
+
+#ifdef _WIN32
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    const uint64_t page = system_info.dwPageSize;
+#else
+    const long system_page = sysconf(_SC_PAGESIZE);
+    const uint64_t page = system_page > 0 ? (uint64_t) system_page : 0;
+#endif
+    if (!page) {
+        return false;
+    }
+
+    ggml_backend_hexagon_runtime_info_v1 info = {};
+    info.version = GGML_HEXAGON_RUNTIME_INFO_VERSION;
+    info.op_stage = selected->runtime_op_stage;
+    info.max_buffer_bytes = htp_runtime_max_buffer_payload(selected->max_bufsize, HTP_MMAP_MAX_VMEM, 4 * 1024);
+    info.max_batch_vmem_bytes = selected->max_vmem;
+    info.vtcm_bytes = selected->vtcm_size;
+    info.tensor_guard_bytes = 4 * 1024;
+    info.buffer_alignment = 128;
+    info.allocation_page_bytes = page;
+
+    htp_memory_count host, shared;
+    host.add(sizeof(*registry));
+    for (size_t i = 0; i < opt_ndev; ++i) {
+        auto * sess = static_cast<ggml_hexagon_session *>(registry->devices[i].context);
+        if (!sess) {
+            continue;
+        }
+        // No operation holds more than one session lock. Registry sessions and
+        // their immutable options are retained until backend registry unload.
+        std::lock_guard<std::mutex> lock(sess->metadata_mutex);
+        if (!sess->op_batch || !sess->op_queue) {
+            return false;
+        }
+        ggml_hexagon_count_session(host, shared, *sess, max_graph_nodes, page);
+        ++info.session_count;
+    }
+    if (!host.valid || !shared.valid || !info.session_count) {
+        return false;
+    }
+    info.host_bytes_bound = host.bytes;
+    info.shared_bytes = shared.bytes;
+    *out = info;
+    return true;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_hexagon_get_runtime_info_v1") == 0) {
+        return (void *) ggml_backend_hexagon_get_runtime_info_v1;
+    }
     if (strcmp(name, "ggml_backend_hexagon_conv_taps_f32") == 0) {
         return (void *) ggml_backend_hexagon_conv_taps_f32;
     }
