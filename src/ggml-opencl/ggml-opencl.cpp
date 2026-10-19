@@ -21578,7 +21578,19 @@ static void ggml_cl_mul_mat_impl(ggml_backend_t backend, const ggml_tensor * src
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32){
-        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
+        // The KQ/KQV image kernels tile K by 16 and M by 64 with no tail:
+        //
+        //   ne00 % 16: the K loop reads 1-15 elements past every row and folds
+        //   them into each output. A KQV over an unpadded n_kv does this.
+        //
+        //   ne01 % 64: the store guards N but not M, so the last tile writes
+        //   64 - (M % 64) values onto the next output row, racing the tile that
+        //   owns it. A KQ over an unpadded n_kv does this, and so does a KQV
+        //   for a head size of 80, 96 or 112.
+        //
+        // Declining leaves those shapes on the generic GEMM.
+        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 &&
+            (ne00 % 16) == 0 && (ne01 % 64) == 0 && (ne12 % ne02) == 0  &&
             // the KQ/KQV image kernels do not handle dim 3 (multi-stream batches)
             ne03 == 1 && ne13 == 1 &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
