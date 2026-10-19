@@ -5797,6 +5797,65 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Attention products read from a KV cache, as a decoder graph builds them: K and
+// V are views of an F16 cache with room for n_ctx positions of n_head_kv heads,
+// attended by n_head query heads over its first n_kv positions. KQ multiplies the
+// key rows by permuted queries; KQV multiplies the value columns of a transposed
+// cache by the scores.
+struct test_mul_mat_kv_cache : public test_case {
+    const bool kqv;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_kv;
+    const int64_t n_ctx;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR7(kqv, head_dim, n_head, n_head_kv, n_kv, n_ctx, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * head_dim * n_kv * n_tokens * n_head;
+    }
+
+    test_mul_mat_kv_cache(bool kqv = false, int64_t head_dim = 128, int64_t n_head = 16, int64_t n_head_kv = 8,
+            int64_t n_kv = 437, int64_t n_ctx = 512, int64_t n_tokens = 256)
+        : kqv(kqv), head_dim(head_dim), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_ctx(n_ctx),
+          n_tokens(n_tokens) {}
+
+    ggml_tensor * build_kq(ggml_context * ctx) {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim * n_head_kv, n_ctx);
+        ggml_set_name(cache, "k_cache");
+        ggml_tensor * k = ggml_view_3d(ctx, cache, head_dim, n_kv, n_head_kv, cache->nb[1],
+                head_dim * ggml_element_size(cache), 0);
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(q, "q");
+        return ggml_mul_mat(ctx, k, ggml_permute(ctx, q, 0, 2, 1, 3));
+    }
+
+    ggml_tensor * build_kqv(ggml_context * ctx) {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_ctx, head_dim * n_head_kv);
+        ggml_set_name(cache, "v_cache");
+        ggml_tensor * v = ggml_view_3d(ctx, cache, n_kv, head_dim, n_head_kv, cache->nb[1],
+                cache->nb[1] * head_dim, 0);
+        ggml_tensor * scores = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tokens, n_head);
+        ggml_set_name(scores, "scores");
+        return ggml_mul_mat(ctx, v, scores);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = kqv ? build_kqv(ctx) : build_kq(ctx);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -13538,6 +13597,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 #endif
+
+    // KQ and KQV read from a KV cache: n_kv on and off the 64-row and 16-column
+    // tiles of the Adreno image kernels, in padded and exact caches, with and
+    // without grouped-query heads, a token count off the 32-column tile, and a
+    // head size off the 64-row tile.
+    for (bool kqv : {false, true}) {
+        for (int64_t n_kv : {256, 181, 437}) {
+            test_cases.emplace_back(new test_mul_mat_kv_cache(kqv, 128, 16, 16, n_kv, 512, 256));
+            test_cases.emplace_back(new test_mul_mat_kv_cache(kqv, 128, 16,  8, n_kv, 512, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_kv_cache(kqv, 128, 16, 8, 437, 437, 64));
+        test_cases.emplace_back(new test_mul_mat_kv_cache(kqv, 128, 16, 8, 256, 512, 45));
+    }
+    test_cases.emplace_back(new test_mul_mat_kv_cache(true, 80, 16, 8, 256, 512, 256));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));

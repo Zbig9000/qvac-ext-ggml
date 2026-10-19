@@ -90,6 +90,18 @@ verified mechanisms.
   text encoder 0.99941, cond 0.99947, DiT 0.989, VAE 0.999992 (Adreno OpenCL on
   the same phone: 0.99991 / 0.99913 / 0.99924 / 0.958 / 0.999992).
 
+## ggml-opencl on Adreno 830 (Galaxy S25)
+
+- The F16 x F32 KQ/KQV image kernels (`ggml_cl_mul_mat_kq_kqv_adreno`, run for 32+
+  query tokens) tile K by 16 and M by 64 with no tail, so a KV length or head size
+  off those tiles gave wrong results: `test-backend-ops -o MUL_MAT -p kqv=` measured
+  NMSE 0.020-0.029 for KQ and 1.47 for KQV at n_kv 181/437, and 0.38 for a KQV with
+  head size 80. Shared (grouped-query) KV heads are not the cause; aligned cases
+  pass with 16 query heads over 8 KV heads. The dispatch now declines
+  `ne00 % 16 != 0` and `ne01 % 64 != 0`, which leaves those shapes on the generic
+  GEMM. MOSS-Transcribe-Diarize prefill on the unfused graph went from cosine
+  0.844 to 0.99988 against the Hugging Face logits.
+
 ## ggml-vulkan on AMD Strix Halo (Radeon 8060S, RADV GFX1151, Mesa 25.2.8)
 
 - Runtime device line: `uma: 1 | fp16: 1 | bf16: 0 | warp size: 64 | shared memory:
