@@ -93,8 +93,10 @@ if (NOT GGML_SHARED_LIB)
     endif()
 
     # Same reasoning as Vulkan: a static ggml-webgpu carries Dawn in its link
-    # interface, while a dlopen'd module resolves Dawn inside itself.
-    if (GGML_WEBGPU AND NOT GGML_BACKEND_DL)
+    # interface, while a dlopen'd module resolves Dawn inside itself. Under
+    # Emscripten the backend links the emdawnwebgpu port through its exported
+    # link options instead, so there is no native Dawn package to find.
+    if (GGML_WEBGPU AND NOT GGML_BACKEND_DL AND NOT EMSCRIPTEN)
         find_dependency(Dawn)
         set(GGML_WEBGPU_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:dawn::webgpu_dawn>)
     endif()
