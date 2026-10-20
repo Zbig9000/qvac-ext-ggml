@@ -14,8 +14,11 @@ override wg_size: u32;
 override bytes_per_thread: u32;
 
 @compute @workgroup_size(wg_size)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x * bytes_per_thread;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>) {
+    // 2-D grid so large buffers stay under maxComputeWorkgroupsPerDimension.
+    let thread = gid.x + num_wg.x * wg_size * gid.y;
+    let i = thread * bytes_per_thread;
     let start = params.offset;
     let end = params.offset + params.size;
 

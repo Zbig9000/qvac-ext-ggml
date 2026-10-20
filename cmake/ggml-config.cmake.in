@@ -92,6 +92,13 @@ if (NOT GGML_SHARED_LIB)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
 
+    # Same reasoning as Vulkan: a static ggml-webgpu carries Dawn in its link
+    # interface, while a dlopen'd module resolves Dawn inside itself.
+    if (GGML_WEBGPU AND NOT GGML_BACKEND_DL)
+        find_dependency(Dawn)
+        set(GGML_WEBGPU_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:dawn::webgpu_dawn>)
+    endif()
+
     if (GGML_HIP)
         find_dependency(hip)
         find_dependency(hipblas)

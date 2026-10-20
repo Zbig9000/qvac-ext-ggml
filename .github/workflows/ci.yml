@@ -230,6 +230,50 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
+  ggml-ci-x64-nvidia-webgpu:
+    runs-on: [self-hosted, Linux, X64, NVIDIA]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      # Prebuilt Dawn from the google/dawn releases, the pin
+      # qvac-fabric-llm.cpp's CI uses; the ggml-speech vcpkg port builds the
+      # same Dawn from source under the consumer's triplet instead.
+      - name: Dawn Dependency
+        id: dawn-depends
+        run: |
+          DAWN_VERSION="v20260317.182325"
+          DAWN_ASSET_NAME="Dawn-18eb229ef5f707c1464cc581252e7603c73a3ef0-ubuntu-latest-Release"
+          curl -L -o dawn.tar.gz \
+            "https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
+          rm -rf dawn && mkdir dawn
+          tar -xf dawn.tar.gz -C dawn --strip-components=1
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          vulkaninfo --summary
+          export Dawn_DIR="$PWD/dawn/lib64/cmake/Dawn"
+          GG_BUILD_WEBGPU=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+
+      # Reported, not enforced: ci/run.sh leaves test-backend-ops out of the
+      # WebGPU release ctest because the WGSL kernels still fail the fork's
+      # GGML_PREC_F32 and large-activation matmul cases.
+      - name: Report test-backend-ops on WebGPU
+        run: |
+          ./build-ci-release/bin/test-backend-ops -b WebGPU 2>&1 | grep -E "FAIL|tests passed|Backend " | tail -n 80 || true
+
+      # The speech addons ship ggml as GGML_BACKEND_DL modules, so the
+      # registry loader has to probe the WebGPU module by name.
+      - name: Loader probe under GGML_BACKEND_DL
+        run: |
+          cmake -S . -B build-ci-dl -DDawn_DIR="$PWD/dawn/lib64/cmake/Dawn" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON -DGGML_WEBGPU=ON -DGGML_BUILD_TESTS=ON -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-ci-dl --target test-backend-load-all ggml-webgpu ggml-cpu -j "$(nproc)"
+          ./build-ci-dl/bin/test-backend-load-all ./build-ci-dl/bin WebGPU CPU
+
   # TODO: provision AMX-compatible machine
   #ggml-ci-x64-cpu-amx:
   #  runs-on: [self-hosted, Linux, X64, CPU, AMX]

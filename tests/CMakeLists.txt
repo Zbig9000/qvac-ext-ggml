@@ -180,6 +180,26 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+# Every backend compiled into this build must be reachable through the
+# registry after ggml_backend_load_all_from_path(); under GGML_BACKEND_DL
+# that is the loader's probe list, which must name each module.
+set(TEST_TARGET test-backend-load-all)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+set(GGML_LOAD_ALL_EXPECTED_BACKENDS CPU)
+if (GGML_WEBGPU)
+    list(APPEND GGML_LOAD_ALL_EXPECTED_BACKENDS WebGPU)
+endif()
+add_test(NAME ${TEST_TARGET}
+         COMMAND $<TARGET_FILE:${TEST_TARGET}> $<TARGET_FILE_DIR:ggml-base> ${GGML_LOAD_ALL_EXPECTED_BACKENDS})
+
+# Byte-granular tensor I/O at buffer offsets that are not word aligned, on
+# every registered device.
+set(TEST_TARGET test-backend-unaligned-io)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 # test-backend-ops
 
 set(TEST_TARGET test-backend-ops)

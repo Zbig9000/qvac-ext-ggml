@@ -16,6 +16,7 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -103,6 +104,13 @@ static void * const webgpu_ptr_base = (void *) (uintptr_t) 0x1000;  // NOLINT
 static size_t ggml_webgpu_tensor_offset(const ggml_tensor * tensor) {
     const ggml_tensor * base_tensor = tensor->view_src ? tensor->view_src : tensor;
     return (size_t) ((uintptr_t) base_tensor->data - (uintptr_t) webgpu_ptr_base) + tensor->view_offs;
+}
+
+// Bytes from a buffer offset up to the next 4-byte word boundary, which is
+// what WriteBuffer/CopyBufferToBuffer and the memset shader's word writes need.
+static size_t ggml_webgpu_bytes_to_word_boundary(size_t offset) {
+    return (WEBGPU_STORAGE_BUF_BINDING_MULT - offset % WEBGPU_STORAGE_BUF_BINDING_MULT) %
+           WEBGPU_STORAGE_BUF_BINDING_MULT;
 }
 
 /* Struct definitions */
@@ -666,7 +674,10 @@ static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_bind_group_entry(0, buf, 0, buf.GetSize()) };
     size_t                            bytes_per_wg =
         ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup * ctx->capabilities.memset_bytes_per_thread;
-    uint32_t wg_x = CEIL_DIV(size + 3, bytes_per_wg);
+    uint32_t wg_x = 1;
+    uint32_t wg_y = 1;
+    compute_2d_workgroups(CEIL_DIV(size + 3, bytes_per_wg), ctx->capabilities.limits.maxComputeWorkgroupsPerDimension,
+                          wg_x, wg_y);
 
     ctx->queue.WriteBuffer(ctx->memset_params_buf, 0, params.data(), params.size() * sizeof(uint32_t));
 
@@ -688,7 +699,7 @@ static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
     wgpu::ComputePassEncoder pass    = encoder.BeginComputePass();
     pass.SetPipeline(ctx->memset_pipeline.pipeline);
     pass.SetBindGroup(0, bind_group);
-    pass.DispatchWorkgroups(wg_x, 1, 1);
+    pass.DispatchWorkgroups(wg_x, wg_y, 1);
     pass.End();
 
     wgpu::CommandBuffer              command  = encoder.Finish();
@@ -3160,7 +3171,8 @@ static webgpu_encoded_op ggml_webgpu_sum_rows(webgpu_context & ctx, ggml_tensor 
                                      total_sum ? 0 : (uint32_t) (src->nb[3] / ggml_type_size(src->type)),
                                      total_sum ? static_cast<uint32_t>(ggml_nelements(src)) : (uint32_t) src->ne[0],
                                      total_sum ? 1 : (uint32_t) src->ne[1],
-                                     total_sum ? 1 : (uint32_t) src->ne[2] };
+                                     total_sum ? 1 : (uint32_t) src->ne[2],
+                                     total_sum ? 1 : (uint32_t) ggml_nrows(dst) };
 
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src),
                                                   ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst) };
@@ -3172,8 +3184,13 @@ static webgpu_encoded_op ggml_webgpu_sum_rows(webgpu_context & ctx, ggml_tensor 
 
     webgpu_pipeline pipeline = ctx->shader_lib->get_sum_rows_pipeline(shader_lib_ctx);
 
-    uint32_t wg_x = total_sum ? 1 : ggml_nrows(dst);
-    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x);
+    uint32_t wg_x = 1;
+    uint32_t wg_y = 1;
+    if (!total_sum) {
+        compute_2d_workgroups(ggml_nrows(dst), ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension,
+                              wg_x, wg_y);
+    }
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
 static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -3571,32 +3588,21 @@ static void ggml_backend_webgpu_event_wait(ggml_backend_t backend, ggml_backend_
     ggml_backend_webgpu_device_event_synchronize(nullptr, event);
 }
 
+static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                  ggml_tensor *         tensor,
+                                                  const void *          data,
+                                                  size_t                offset,
+                                                  size_t                size);
+
+// Queue writes are ordered, so the asynchronous upload is the same
+// alignment-safe sequence as the synchronous one.
 static void ggml_backend_webgpu_set_tensor_async(ggml_backend_t backend,
                                                  ggml_tensor *  tensor,
                                                  const void *   data,
                                                  size_t         offset,
                                                  size_t         size) {
     GGML_UNUSED(backend);
-    auto * buf_ctx      = (ggml_backend_webgpu_buffer_context *) tensor->buffer->context;
-    size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
-
-    // Write aligned portion
-    buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
-
-    if (size % 4 != 0) {
-        // If size is not a multiple of 4, we need to memset the remaining bytes
-        size_t remaining_size = size % 4;
-
-        // pack the remaining bytes into a uint32_t
-        uint32_t val32 = 0;
-
-        for (size_t i = 0; i < remaining_size; i++) {
-            ((uint8_t *) &val32)[i] = ((const uint8_t *) data)[size - remaining_size + i];
-        }
-        // memset the remaining bytes
-        ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32,
-                                          total_offset + (size - remaining_size), remaining_size);
-    }
+    ggml_backend_webgpu_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
 }
 
 static void ggml_backend_webgpu_synchronize(ggml_backend_t backend) {
@@ -3664,8 +3670,36 @@ static void ggml_backend_webgpu_buffer_memset_tensor(ggml_backend_buffer_t buffe
 
     // This is a trick to set all bytes of a u32 to the same 1 byte value.
     uint32_t val32 = (uint32_t) value * 0x01010101;
-    ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32, total_offset, size);
+    // The memset shader writes whole words from its start offset, so an
+    // unaligned start is split off and written through its masked tail path.
+    const size_t head = std::min(ggml_webgpu_bytes_to_word_boundary(total_offset), size);
+    if (head > 0) {
+        ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32, total_offset, head);
+    }
+    if (size > head) {
+        ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32, total_offset + head,
+                                          size - head);
+    }
     WEBGPU_CPU_PROFILE_TOTAL_END(memset_tensor, buf_ctx->global_ctx);
+}
+
+// Pack up to one word's worth of bytes into the lanes the memset shader writes
+// for byte positions offset..offset+count, which must not cross a word.
+static uint32_t ggml_webgpu_pack_word_lanes(const uint8_t * bytes, size_t offset, size_t count) {
+    uint32_t     packed = 0;
+    const size_t lane   = offset % WEBGPU_STORAGE_BUF_BINDING_MULT;
+    for (size_t i = 0; i < count; i++) {
+        reinterpret_cast<uint8_t *>(&packed)[lane + i] = bytes[i];
+    }
+    return packed;
+}
+
+static void ggml_backend_webgpu_write_partial_word(webgpu_global_context & ctx,
+                                                   wgpu::Buffer &          buf,
+                                                   const uint8_t *         bytes,
+                                                   size_t                  offset,
+                                                   size_t                  count) {
+    ggml_backend_webgpu_buffer_memset(ctx, buf, ggml_webgpu_pack_word_lanes(bytes, offset, count), offset, count);
 }
 
 static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -3681,21 +3715,22 @@ static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
-    buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
+    // WriteBuffer needs a 4-byte aligned offset and size, so the bytes before
+    // the first and after the last aligned word go through the masked memset.
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    const size_t    head  = std::min(ggml_webgpu_bytes_to_word_boundary(total_offset), size);
+    const size_t    body  = ((size - head) / WEBGPU_STORAGE_BUF_BINDING_MULT) * WEBGPU_STORAGE_BUF_BINDING_MULT;
+    const size_t    tail  = size - head - body;
 
-    if (size % 4 != 0) {
-        // If size is not a multiple of 4, we need to memset the remaining bytes
-        size_t remaining_size = size % 4;
-
-        // pack the remaining bytes into a uint32_t
-        uint32_t val32 = 0;
-
-        for (size_t i = 0; i < remaining_size; i++) {
-            ((uint8_t *) &val32)[i] = ((const uint8_t *) data)[size - remaining_size + i];
-        }
-        // memset the remaining bytes
-        ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32,
-                                          total_offset + (size - remaining_size), remaining_size);
+    if (head > 0) {
+        ggml_backend_webgpu_write_partial_word(buf_ctx->global_ctx, buf_ctx->buffer, bytes, total_offset, head);
+    }
+    if (body > 0) {
+        buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset + head, bytes + head, body);
+    }
+    if (tail > 0) {
+        ggml_backend_webgpu_write_partial_word(buf_ctx->global_ctx, buf_ctx->buffer, bytes + head + body,
+                                               total_offset + head + body, tail);
     }
     WEBGPU_CPU_PROFILE_TOTAL_END(set_tensor, buf_ctx->global_ctx);
 }
@@ -3713,12 +3748,11 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
-    size_t final_size = size;
-    if (size % 4 != 0) {
-        // If size is not a multiple of 4, we need to round it up to the next
-        // multiple of 4
-        final_size = size + (4 - (size % 4));
-    }
+    // CopyBufferToBuffer needs 4-byte aligned offsets and sizes: copy from the
+    // word containing the first byte and skip the lead-in when reading back.
+    const size_t lead           = total_offset % WEBGPU_STORAGE_BUF_BINDING_MULT;
+    const size_t aligned_offset = total_offset - lead;
+    const size_t final_size     = ROUNDUP_POW2(lead + size, WEBGPU_STORAGE_BUF_BINDING_MULT);
 
     std::lock_guard<std::recursive_mutex> lock(buf_ctx->global_ctx->mutex);
 
@@ -3734,7 +3768,7 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     // Copy the data from the buffer to the staging buffer
     wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
-    encoder.CopyBufferToBuffer(buf_ctx->buffer, total_offset, buf_ctx->global_ctx->get_tensor_staging_buf, 0,
+    encoder.CopyBufferToBuffer(buf_ctx->buffer, aligned_offset, buf_ctx->global_ctx->get_tensor_staging_buf, 0,
                                final_size);
     wgpu::CommandBuffer commands = encoder.Finish();
 
@@ -3748,7 +3782,7 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
     const void * mapped_range = buf_ctx->global_ctx->get_tensor_staging_buf.GetConstMappedRange(0, final_size);
 
     // Copy the data from the mapped range to the output buffer
-    std::memcpy(data, mapped_range, size);
+    std::memcpy(data, static_cast<const uint8_t *>(mapped_range) + lead, size);
     buf_ctx->global_ctx->get_tensor_staging_buf.Unmap();
     WEBGPU_CPU_PROFILE_TOTAL_END(get_tensor, buf_ctx->global_ctx);
 }
@@ -3990,6 +4024,7 @@ static void ggml_webgpu_init_memset_pipeline(webgpu_global_context & ctx) {
 
 static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
+    options.powerPreference         = wgpu::PowerPreference::HighPerformance;
 
 #ifndef __EMSCRIPTEN__
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4713,6 +4748,46 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
+static bool ggml_webgpu_adapter_has_implicit_sync(const wgpu::Adapter & adapter) {
+#ifdef __EMSCRIPTEN__
+    GGML_UNUSED(adapter);
+    return true;
+#else
+    return adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization);
+#endif
+}
+
+// Dawn's Null backend accepts every feature and executes nothing, so a host
+// without a usable GPU would otherwise "run" inference on it and return
+// garbage instead of falling back to the CPU backend.
+static bool ggml_webgpu_adapter_is_null_backend(const wgpu::Adapter & adapter) {
+    wgpu::AdapterInfo info;
+    adapter.GetInfo(&info);
+    return info.backendType == wgpu::BackendType::Null;
+}
+
+static bool ggml_webgpu_adapter_is_usable(const wgpu::Adapter & adapter) {
+    if (adapter == nullptr) {
+        GGML_LOG_WARN("ggml_webgpu: no adapter available, registering no device\n");
+        return false;
+    }
+    if (ggml_webgpu_adapter_is_null_backend(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: only Dawn's Null adapter is available (no usable GPU), registering no device\n");
+        return false;
+    }
+    if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, registering no device "
+                      "(Chromium on NVIDIA/Vulkan hides it unless launched with "
+                      "--enable-dawn-features=vulkan_enable_f16_on_nvidia)\n");
+        return false;
+    }
+    if (!ggml_webgpu_adapter_has_implicit_sync(adapter)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks implicit device synchronization, registering no device\n");
+        return false;
+    }
+    return true;
+}
+
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
 
@@ -4759,12 +4834,7 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
         ggml_backend_webgpu_request_adapter(ctx->webgpu_global_ctx->instance, adapter);
     }
 
-    // WebGPU backend requires f16 support and, on native, implicit device synchronization.
-    if (adapter != nullptr && adapter.HasFeature(wgpu::FeatureName::ShaderF16)
-#ifndef __EMSCRIPTEN__
-        && adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)
-#endif
-    ) {
+    if (ggml_webgpu_adapter_is_usable(adapter)) {
         ctx->device_count = 1;
     }
 
