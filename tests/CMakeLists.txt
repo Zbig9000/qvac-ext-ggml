@@ -190,8 +190,26 @@ set(GGML_LOAD_ALL_EXPECTED_BACKENDS CPU)
 if (GGML_WEBGPU)
     list(APPEND GGML_LOAD_ALL_EXPECTED_BACKENDS WebGPU)
 endif()
+# The modules of a GGML_BACKEND_DL build land next to the executables, not
+# next to ggml-base, so probe the test's own directory.
 add_test(NAME ${TEST_TARGET}
-         COMMAND $<TARGET_FILE:${TEST_TARGET}> $<TARGET_FILE_DIR:ggml-base> ${GGML_LOAD_ALL_EXPECTED_BACKENDS})
+         COMMAND $<TARGET_FILE:${TEST_TARGET}> $<TARGET_FILE_DIR:${TEST_TARGET}> ${GGML_LOAD_ALL_EXPECTED_BACKENDS})
+
+# Every registered WebGPU device must execute compute (Dawn's Null adapter
+# does not); with the Vulkan drivers hidden from the process Dawn offers only
+# that adapter, which the backend must refuse, leaving the CPU as the best
+# backend.
+if (GGML_WEBGPU)
+    set(TEST_TARGET test-webgpu-null-adapter)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME ${TEST_TARGET}-no-driver COMMAND $<TARGET_FILE:${TEST_TARGET}> --expect-no-device)
+        set_property(TEST ${TEST_TARGET}-no-driver PROPERTY ENVIRONMENT
+            "VK_ICD_FILENAMES=/nonexistent/no-vulkan-driver.json;VK_DRIVER_FILES=/nonexistent/no-vulkan-driver.json")
+    endif()
+endif()
 
 # Byte-granular tensor I/O at buffer offsets that are not word aligned, on
 # every registered device.
